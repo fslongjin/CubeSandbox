@@ -20,10 +20,11 @@ UID = $(shell id -u)
 GID = $(shell id -g)
 PWD = $(shell pwd)
 
-VERSION := $(shell git describe --abbrev=0 --tags 2>/dev/null || echo "0.0.0")
-COMMIT_NO := $(shell git rev-parse HEAD 2>/dev/null || true)
-COMMIT := $(if $(shell git status --porcelain --untracked-files=no 2>/dev/null || true),${COMMIT_NO}-dirty,${COMMIT_NO})
+VERSION := $(if $(strip $(CUBE_VERSION)),$(CUBE_VERSION),$(shell git describe --abbrev=0 --tags --match 'v*' 2>/dev/null || echo "0.0.0-dev"))
+COMMIT_NO := $(if $(strip $(CUBE_COMMIT)),$(CUBE_COMMIT),$(shell git rev-parse HEAD 2>/dev/null || true))
+COMMIT := $(if $(strip $(CUBE_COMMIT)),$(CUBE_COMMIT),$(if $(shell git status --porcelain --untracked-files=no 2>/dev/null || true),${COMMIT_NO}-dirty,${COMMIT_NO}))
 COMMIT_MSG = $(if $(COMMIT),$(COMMIT),unknown)
+BUILD_TIME := $(if $(strip $(CUBE_BUILD_TIME)),$(CUBE_BUILD_TIME),$(shell date -u +'%Y-%m-%dT%H:%M:%SZ'))
 
 export VERSION_COMMIT := $(if $(COMMIT),$(COMMIT),$(VERSION))
 
@@ -88,7 +89,7 @@ AGENT_NAME = $(TARGET)
 API_VERSION = 0.0.1
 AGENT_VERSION = $(VERSION)
 
-GENERATED_REPLACEMENTS = AGENT_NAME AGENT_VERSION API_VERSION BINDIR COMMIT VERSION_COMMIT
+GENERATED_REPLACEMENTS = AGENT_NAME AGENT_VERSION API_VERSION BINDIR COMMIT VERSION_COMMIT BUILD_TIME
 GENERATED_FILES = $(GENERATED_CODE)
 
 define get_command_version
@@ -112,7 +113,7 @@ logging-crate-tests:
 $(TARGET_PATH): show-summary
 	@RUSTFLAGS="$(EXTRA_RUSTFLAGS) --deny warnings" cargo build $(if $(findstring release,$(BUILD_TYPE)),--release) $(CARGO_TARGET_FLAG) $(EXTRA_RUSTFEATURES)
 
-$(GENERATED_FILES): %: %.in
+$(GENERATED_FILES): %: %.in FORCE
 	@sed $(foreach r,$(GENERATED_REPLACEMENTS),-e 's|@$r@|$($r)|g') "$<" > "$@"
 
 ##TARGET optimize: optimized build
@@ -131,6 +132,11 @@ clean:
 ##TARGET test: run tests
 test:
 	@cargo test --all $(EXTRA_RUSTFEATURES) -- --nocapture
+
+##TARGET fmt: format code
+fmt: $(GENERATED_FILES)
+	@if [ ! -f libs/protocols/src/agent.rs ]; then cargo check -p protocols; fi
+	cargo fmt
 
 ##TARGET check: run lint/fmt check
 check: $(GENERATED_FILES)
@@ -175,6 +181,8 @@ generate-protocols:
 	clean \
 	default \
 	docker \
+	fmt \
+	FORCE \
 	generate-protocols \
 	help \
 	install \

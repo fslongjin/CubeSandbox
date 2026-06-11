@@ -25,18 +25,28 @@ import (
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/cubelet"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/errorcode"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/localcache"
+	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/sandboxspec"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/service/sandbox"
 	sandboxtypes "github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/service/sandbox/types"
+	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/task"
 	"gorm.io/gorm"
 )
 
 const (
-	DefaultTemplateVersion = "v2"
+	DefaultTemplateVersion              = "v2"
+	snapshotRuntimeRefReleasedByDestroy = "sandbox destroyed"
 
 	StatusPending        = "PENDING"
 	StatusReady          = "READY"
 	StatusPartiallyReady = "PARTIALLY_READY"
 	StatusFailed         = "FAILED"
+	StatusCreating       = "CREATING"
+	StatusDeleting       = "DELETING"
+
+	TemplateKindTemplate = "template"
+	TemplateKindSnapshot = "snapshot"
+
+	StorageBackendCow = "cubecow"
 
 	ReplicaStatusReady  = "READY"
 	ReplicaStatusFailed = "FAILED"
@@ -70,12 +80,17 @@ var (
 	storeOnce sync.Once
 )
 
+// ReplicaStatus is the master-side, control-plane view of a template replica
+// on a given node. v5: physical fields (rootfs_vol, memory_vol, snapshot_path,
+// meta_dir, build_rootfs_vol, rootfs_kind, memory_kind, rootfs_dev,
+// memory_dev) were removed because Cubelet's local snapshot catalog is the
+// single source of truth, queried by templateID/snapshotID at restore/cleanup
+// time.
 type ReplicaStatus struct {
 	NodeID          string `json:"node_id"`
 	NodeIP          string `json:"node_ip"`
 	InstanceType    string `json:"instance_type,omitempty"`
 	Spec            string `json:"spec,omitempty"`
-	SnapshotPath    string `json:"snapshot_path,omitempty"`
 	Status          string `json:"status"`
 	Phase           string `json:"phase,omitempty"`
 	ArtifactID      string `json:"artifact_id,omitempty"`
@@ -86,19 +101,62 @@ type ReplicaStatus struct {
 }
 
 type TemplateInfo struct {
-	TemplateID   string          `json:"template_id"`
-	InstanceType string          `json:"instance_type,omitempty"`
-	Version      string          `json:"version,omitempty"`
-	Status       string          `json:"status"`
-	LastError    string          `json:"last_error,omitempty"`
-	CreatedAt    string          `json:"created_at,omitempty"`
-	ImageInfo    string          `json:"image_info,omitempty"`
-	Replicas     []ReplicaStatus `json:"replicas,omitempty"`
+	TemplateID                string          `json:"template_id"`
+	InstanceType              string          `json:"instance_type,omitempty"`
+	Version                   string          `json:"version,omitempty"`
+	Status                    string          `json:"status"`
+	Kind                      string          `json:"kind,omitempty"`
+	OriginSandboxID           string          `json:"origin_sandbox_id,omitempty"`
+	OriginNodeID              string          `json:"origin_node_id,omitempty"`
+	DisplayName               string          `json:"display_name,omitempty"`
+	StorageBackend            string          `json:"storage_backend,omitempty"`
+	Retain                    bool            `json:"retain,omitempty"`
+	RootfsSizeBytesAtSnapshot uint64          `json:"rootfs_size_bytes_at_snapshot,omitempty"`
+	LastError                 string          `json:"last_error,omitempty"`
+	CreatedAt                 string          `json:"created_at,omitempty"`
+	ImageInfo                 string          `json:"image_info,omitempty"`
+	Replicas                  []ReplicaStatus `json:"replicas,omitempty"`
+
+	// CubeEgress CA bake metadata, surfaced for ops triage. Populated
+	// from the RootfsArtifact row pointed to by the first replica.
+	// All replicas of one template share the same artifact, so a
+	// single lookup covers them. Empty/zero on legacy templates that
+	// were built before the CA feature existed.
+	CubeEgressCABaked          bool   `json:"cube_egress_ca_baked,omitempty"`
+	CubeEgressCAFingerprint    string `json:"cube_egress_ca_fingerprint,omitempty"`
+	CubeEgressCATargetsWritten int    `json:"cube_egress_ca_targets_written,omitempty"`
+}
+
+func templateInfoFromDefinition(def models.TemplateDefinition) TemplateInfo {
+	return TemplateInfo{
+		TemplateID:                def.TemplateID,
+		InstanceType:              def.InstanceType,
+		Version:                   def.Version,
+		Status:                    def.Status,
+		Kind:                      def.Kind,
+		OriginSandboxID:           def.OriginSandboxID,
+		OriginNodeID:              def.OriginNodeID,
+		DisplayName:               def.DisplayName,
+		StorageBackend:            def.StorageBackend,
+		Retain:                    def.Retain,
+		RootfsSizeBytesAtSnapshot: def.RootfsSizeBytesAtSnapshot,
+		LastError:                 def.LastError,
+	}
 }
 
 type replicaRunOptions struct {
 	ArtifactID string
 	JobID      string
+}
+
+type definitionCreateOptions struct {
+	Kind                      string
+	OriginSandboxID           string
+	OriginNodeID              string
+	DisplayName               string
+	StorageBackend            string
+	Retain                    bool
+	RootfsSizeBytesAtSnapshot uint64
 }
 
 func ListTemplates(ctx context.Context) ([]TemplateInfo, error) {
@@ -130,15 +188,10 @@ func ListTemplates(ctx context.Context) ([]TemplateInfo, error) {
 		if latestJob := latestJobByTemplateID[def.TemplateID]; latestJob != nil {
 			imageInfo = composeImageInfo(latestJob.SourceImageRef, latestJob.SourceImageDigest)
 		}
-		out = append(out, TemplateInfo{
-			TemplateID:   def.TemplateID,
-			InstanceType: def.InstanceType,
-			Version:      def.Version,
-			Status:       def.Status,
-			LastError:    def.LastError,
-			CreatedAt:    formatUTCRFC3339(def.CreatedAt),
-			ImageInfo:    imageInfo,
-		})
+		info := templateInfoFromDefinition(def)
+		info.CreatedAt = formatUTCRFC3339(def.CreatedAt)
+		info.ImageInfo = imageInfo
+		out = append(out, info)
 	}
 	seen := make(map[string]struct{}, len(out))
 	for _, item := range out {
@@ -161,122 +214,53 @@ func Init(ctx context.Context) error {
 	}
 	var initErr error
 	storeOnce.Do(func() {
+		// Schema is owned by pkg/base/dao/migrate and applied in main.go
+		// before any business package Init runs; here we only attach to
+		// the existing *gorm.DB.
 		store.db = db.Init(config.GetInstanceConfig())
 		store.dbAddr = config.GetInstanceConfig().Addr
-		initErr = initTemplateDefinitionTable(store.db)
-		if initErr != nil {
+		if initErr = sandboxspec.Init(store.db); initErr != nil {
 			return
 		}
-		initErr = initTemplateReplicaTable(store.db)
-		if initErr != nil {
-			return
-		}
-		initErr = initRootfsArtifactTable(store.db)
-		if initErr != nil {
-			return
-		}
-		initErr = initTemplateImageJobTable(store.db)
-		if initErr != nil {
-			return
-		}
+		configureSnapshotRuntimeRefHooks()
+		configureSandboxSpecHooks()
 		if warmErr := warmReadyTemplateLocality(ctx); warmErr != nil {
 			log.G(ctx).Warnf("warm ready template locality fail:%v", warmErr)
 		}
+		startSnapshotReconciler(ctx)
 	})
 	return initErr
 }
 
-func initTemplateDefinitionTable(client *gorm.DB) error {
-	if client.Migrator().HasTable(&models.TemplateDefinition{}) {
+func configureSnapshotRuntimeRefHooks() {
+	releaseBySandboxID := func(ctx context.Context, sandboxID string) error {
+		errReleasingRefs := ReleaseSnapshotRuntimeRefsBySandbox(ctx, sandboxID, snapshotRuntimeRefReleasedByDestroy)
+		errDeletingSpec := sandboxspec.Delete(ctx, sandboxID)
+		if errReleasingRefs != nil && errDeletingSpec != nil {
+			return errors.Join(errReleasingRefs, errDeletingSpec)
+		}
+		if errReleasingRefs != nil {
+			return errReleasingRefs
+		}
+		if errDeletingSpec != nil && !errors.Is(errDeletingSpec, sandboxspec.ErrSandboxSpecNotFound) {
+			return errDeletingSpec
+		}
 		return nil
 	}
-	stmt := &gorm.Statement{DB: client}
-	stmt.Parse(&models.TemplateDefinition{})
-	return client.Exec(`CREATE TABLE IF NOT EXISTS ` + stmt.Schema.Table + ` (
-		id bigint unsigned NOT NULL AUTO_INCREMENT,
-		template_id varchar(128) NOT NULL COMMENT 'template id',
-		instance_type varchar(64) NOT NULL DEFAULT '' COMMENT 'instance type',
-		version varchar(32) NOT NULL DEFAULT '' COMMENT 'template version',
-		status varchar(32) NOT NULL DEFAULT '' COMMENT 'template status',
-		request_json mediumtext NOT NULL COMMENT 'normalized template request json',
-		last_error text COMMENT 'last error message',
-		created_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
-		updated_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
-		deleted_at datetime DEFAULT NULL,
-		PRIMARY KEY (id),
-		UNIQUE KEY idx_template_id (template_id),
-		KEY idx_status (status)
-	  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb3`).Error
+	sandbox.SetAfterDestroySandboxSuccessHook(releaseBySandboxID)
+	task.SetAfterDestroyTaskSuccessHook(releaseBySandboxID)
 }
 
-func initTemplateReplicaTable(client *gorm.DB) error {
-	stmt := &gorm.Statement{DB: client}
-	stmt.Parse(&models.TemplateReplica{})
-	if !client.Migrator().HasTable(&models.TemplateReplica{}) {
-		if err := client.Exec(`CREATE TABLE IF NOT EXISTS ` + stmt.Schema.Table + ` (
-			id bigint unsigned NOT NULL AUTO_INCREMENT,
-			template_id varchar(128) NOT NULL COMMENT 'template id',
-			node_id varchar(128) NOT NULL COMMENT 'node id',
-			node_ip varchar(64) NOT NULL DEFAULT '' COMMENT 'node ip',
-			instance_type varchar(64) NOT NULL DEFAULT '' COMMENT 'instance type',
-			spec varchar(128) NOT NULL DEFAULT '' COMMENT 'resource spec',
-			snapshot_path varchar(1024) NOT NULL DEFAULT '' COMMENT 'snapshot path',
-			status varchar(32) NOT NULL DEFAULT '' COMMENT 'replica status',
-			phase varchar(32) NOT NULL DEFAULT '' COMMENT 'replica phase',
-			artifact_id varchar(128) NOT NULL DEFAULT '' COMMENT 'replica artifact id',
-			last_job_id varchar(128) NOT NULL DEFAULT '' COMMENT 'last redo/create job id',
-			last_error_phase varchar(64) NOT NULL DEFAULT '' COMMENT 'phase where last error happened',
-			cleanup_required tinyint(1) NOT NULL DEFAULT 0 COMMENT 'needs cleanup before redo',
-			error_message text COMMENT 'error message',
-			created_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
-			updated_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
-			deleted_at datetime DEFAULT NULL,
-			PRIMARY KEY (id),
-			UNIQUE KEY idx_template_node (template_id,node_id),
-			KEY idx_template_status (template_id,status)
-		  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb3`).Error; err != nil {
-			return err
-		}
-	}
-	return migrateTemplateReplicaTable(client, stmt.Schema.Table)
-}
-
-func migrateTemplateReplicaTable(client *gorm.DB, tableName string) error {
-	replicaModel := &models.TemplateReplica{}
-	columns := []struct {
-		name string
-		sql  string
-	}{
-		{
-			name: "phase",
-			sql:  `ALTER TABLE ` + tableName + ` ADD COLUMN phase varchar(32) NOT NULL DEFAULT '' AFTER status`,
-		},
-		{
-			name: "artifact_id",
-			sql:  `ALTER TABLE ` + tableName + ` ADD COLUMN artifact_id varchar(128) NOT NULL DEFAULT '' AFTER phase`,
-		},
-		{
-			name: "last_job_id",
-			sql:  `ALTER TABLE ` + tableName + ` ADD COLUMN last_job_id varchar(128) NOT NULL DEFAULT '' AFTER artifact_id`,
-		},
-		{
-			name: "last_error_phase",
-			sql:  `ALTER TABLE ` + tableName + ` ADD COLUMN last_error_phase varchar(64) NOT NULL DEFAULT '' AFTER last_job_id`,
-		},
-		{
-			name: "cleanup_required",
-			sql:  `ALTER TABLE ` + tableName + ` ADD COLUMN cleanup_required tinyint(1) NOT NULL DEFAULT 0 AFTER last_error_phase`,
-		},
-	}
-	for _, column := range columns {
-		if client.Migrator().HasColumn(replicaModel, column.name) {
-			continue
-		}
-		if err := client.Exec(column.sql).Error; err != nil {
-			return err
-		}
-	}
-	return nil
+// configureSandboxSpecHooks wires sandbox create success to the canonical
+// spec store. Failures are swallowed by the sandbox layer (logged only); we
+// still surface them here so future callers of the hook can react.
+func configureSandboxSpecHooks() {
+	sandbox.SetAfterCreateSandboxSuccessHook(func(ctx context.Context, sandboxID, hostID, hostIP string, req *sandboxtypes.CreateCubeSandboxReq) error {
+		return sandboxspec.Put(ctx, sandboxID, req, sandboxspec.PutOptions{
+			HostID: hostID,
+			HostIP: hostIP,
+		})
+	})
 }
 
 func isReady() bool {
@@ -300,6 +284,14 @@ func NormalizeRequest(req *sandboxtypes.CreateCubeSandboxReq) (*sandboxtypes.Cre
 	templateID := strings.TrimSpace(cloned.Annotations[constants.CubeAnnotationAppSnapshotTemplateID])
 	if templateID == "" {
 		templateID = generateTemplateID()
+	} else if !hasValidTemplateIDPrefix(templateID) {
+		// Defensive guard: template IDs must start with "tpl-" (templates
+		// created from images or imports) or "snap-" (snapshot-kind templates).
+		// Reaching this branch means an external caller injected a non-standard
+		// template ID via the annotation. Reject it explicitly rather than
+		// silently accepting it, so the caller can be fixed.
+		return nil, "", fmt.Errorf("invalid template ID %q from annotation %s: must start with 'tpl-' or 'snap-' and include a non-empty suffix",
+			templateID, constants.CubeAnnotationAppSnapshotTemplateID)
 	}
 	cloned.Annotations[constants.CubeAnnotationAppSnapshotTemplateID] = templateID
 	cloned.Annotations[constants.CubeAnnotationsAppSnapshotCreate] = "true"
@@ -318,6 +310,22 @@ func generateTemplateID() string {
 	return "tpl-" + strings.ReplaceAll(uuid.New().String(), "-", "")[:24]
 }
 
+func hasValidTemplateIDPrefix(templateID string) bool {
+	for _, prefix := range []string{"tpl-", "snap-"} {
+		if strings.HasPrefix(templateID, prefix) {
+			return len(templateID) > len(prefix)
+		}
+	}
+	return false
+}
+
+// GenerateTemplateID returns a new unique template ID with "tpl-" prefix.
+// Exported for use by HTTP handlers (e.g. template commit) that need to
+// generate a template ID before calling NormalizeRequest.
+func GenerateTemplateID() string {
+	return generateTemplateID()
+}
+
 func normalizeStoredTemplateRequest(req *sandboxtypes.CreateCubeSandboxReq) (*sandboxtypes.CreateCubeSandboxReq, error) {
 	cloned, templateID, err := NormalizeRequest(req)
 	if err != nil {
@@ -329,6 +337,14 @@ func normalizeStoredTemplateRequest(req *sandboxtypes.CreateCubeSandboxReq) (*sa
 	cloned.InsId = ""
 	cloned.InsIp = ""
 	cloned.Request = nil
+	// v4+: runtime-binding annotations are per-invocation and owned by
+	// cubelet's local catalog. Strip them from the stored template request
+	// so future restores/snapshots cannot drag a stale logical id or
+	// attachment timestamp into the new sandbox's request envelope. Physical
+	// memory-vol annotations were removed entirely in v5 (the constants no
+	// longer exist).
+	delete(cloned.Annotations, constants.CubeAnnotationRuntimeSnapshotID)
+	delete(cloned.Annotations, constants.CubeAnnotationRuntimeSnapshotAttachedAt)
 	cloned.Annotations[constants.CubeAnnotationAppSnapshotTemplateID] = templateID
 	return cloned, nil
 }
@@ -476,7 +492,10 @@ func createReplicaOnNode(ctx context.Context, target *node.Node, req *sandboxtyp
 	}
 	replica.Status = ReplicaStatusReady
 	replica.Phase = ReplicaPhaseReady
-	replica.SnapshotPath = rsp.GetSnapshotPath()
+	// v4: AppSnapshot replica is "thin" -- physical refs are owned by cubelet's
+	// local catalog. Master only persists control-plane state (status / phase /
+	// last job / error) so we deliberately ignore SnapshotPath/RootfsVol/
+	// MemoryVol/RootfsKind/MemoryKind in the RPC response here.
 	replica.LastErrorPhase = ""
 	replica.CleanupRequired = false
 	replica.ErrorMessage = ""
@@ -547,6 +566,7 @@ func createDefinition(ctx context.Context, templateID string, storedReq *sandbox
 		InstanceType: instanceType,
 		Version:      version,
 		Status:       StatusPending,
+		Kind:         TemplateKindTemplate,
 		RequestJSON:  string(payload),
 	}
 	if err = store.db.WithContext(ctx).Table(constants.TemplateDefinitionTableName).Create(model).Error; err != nil {
@@ -556,6 +576,10 @@ func createDefinition(ctx context.Context, templateID string, storedReq *sandbox
 		return err
 	}
 	return nil
+}
+
+func createDefinitionWithOptions(ctx context.Context, templateID string, storedReq *sandboxtypes.CreateCubeSandboxReq, instanceType, version string, opts definitionCreateOptions) error {
+	return createDefinitionTx(ctx, store.db.WithContext(ctx), templateID, storedReq, instanceType, version, opts)
 }
 
 func ensureTemplateDefinition(ctx context.Context, templateID string, storedReq *sandboxtypes.CreateCubeSandboxReq, instanceType, version string) (bool, error) {
@@ -628,16 +652,28 @@ func GetTemplateInfo(ctx context.Context, templateID string) (*TemplateInfo, err
 	if err != nil {
 		return nil, err
 	}
-	out := &TemplateInfo{
-		TemplateID:   def.TemplateID,
-		InstanceType: def.InstanceType,
-		Version:      def.Version,
-		Status:       def.Status,
-		LastError:    def.LastError,
-		Replicas:     make([]ReplicaStatus, 0, len(replicas)),
-	}
+	info := templateInfoFromDefinition(*def)
+	out := &info
+	out.Replicas = make([]ReplicaStatus, 0, len(replicas))
 	for _, replica := range replicas {
 		out.Replicas = append(out.Replicas, replicaModelToStatus(replica))
+	}
+	// Populate CA bake metadata from the artifact referenced by the
+	// first replica with a non-empty ArtifactID. Errors here are
+	// non-fatal — the CA fields stay zero, the rest of the template
+	// info is still useful. Worst case the operator can re-query.
+	for _, r := range out.Replicas {
+		if r.ArtifactID == "" {
+			continue
+		}
+		artifact, err := getRootfsArtifactByID(ctx, r.ArtifactID)
+		if err != nil {
+			break
+		}
+		out.CubeEgressCABaked = artifact.CubeEgressCABaked
+		out.CubeEgressCAFingerprint = artifact.CubeEgressCAFingerprint
+		out.CubeEgressCATargetsWritten = artifact.CubeEgressCATargetsWritten
+		break
 	}
 	return out, nil
 }
@@ -679,6 +715,12 @@ func composeImageInfo(ref, digest string) string {
 	}
 	if imageDigest == "" {
 		return imageRef
+	}
+	// Tolerate historical rows where SourceImageDigest was stored as a
+	// full canonical reference ("name@sha256:..."). Strip the "name@"
+	// prefix so we never produce "name:tag@name@sha256:...".
+	if at := strings.Index(imageDigest, "@"); at >= 0 && at+1 < len(imageDigest) {
+		imageDigest = imageDigest[at+1:]
 	}
 	if strings.Contains(imageRef, "@") {
 		return imageRef
@@ -797,7 +839,6 @@ func replicaModelToStatus(replica models.TemplateReplica) ReplicaStatus {
 		NodeIP:          replica.NodeIP,
 		InstanceType:    replica.InstanceType,
 		Spec:            replica.Spec,
-		SnapshotPath:    replica.SnapshotPath,
 		Status:          replica.Status,
 		Phase:           replica.Phase,
 		ArtifactID:      replica.ArtifactID,
@@ -805,6 +846,39 @@ func replicaModelToStatus(replica models.TemplateReplica) ReplicaStatus {
 		LastErrorPhase:  replica.LastErrorPhase,
 		CleanupRequired: replica.CleanupRequired,
 		ErrorMessage:    replica.ErrorMessage,
+	}
+}
+
+func replicaStatusToModel(templateID, instanceType string, replica ReplicaStatus) *models.TemplateReplica {
+	return &models.TemplateReplica{
+		TemplateID:      templateID,
+		NodeID:          replica.NodeID,
+		NodeIP:          replica.NodeIP,
+		InstanceType:    instanceType,
+		Spec:            replica.Spec,
+		Status:          replica.Status,
+		Phase:           replica.Phase,
+		ArtifactID:      replica.ArtifactID,
+		LastJobID:       replica.LastJobID,
+		LastErrorPhase:  replica.LastErrorPhase,
+		CleanupRequired: replica.CleanupRequired,
+		ErrorMessage:    replica.ErrorMessage,
+	}
+}
+
+func replicaStatusUpdateFields(instanceType string, replica ReplicaStatus) map[string]any {
+	return map[string]any{
+		"node_ip":          replica.NodeIP,
+		"instance_type":    instanceType,
+		"spec":             replica.Spec,
+		"status":           replica.Status,
+		"phase":            replica.Phase,
+		"artifact_id":      replica.ArtifactID,
+		"last_job_id":      replica.LastJobID,
+		"last_error_phase": replica.LastErrorPhase,
+		"cleanup_required": replica.CleanupRequired,
+		"error_message":    replica.ErrorMessage,
+		"updated_at":       time.Now(),
 	}
 }
 
@@ -820,35 +894,10 @@ func UpsertReplica(ctx context.Context, templateID, instanceType string, replica
 		if !errors.Is(err, gorm.ErrRecordNotFound) {
 			return err
 		}
-		record.TemplateID = templateID
-		record.NodeID = replica.NodeID
-		record.NodeIP = replica.NodeIP
-		record.InstanceType = instanceType
-		record.Spec = replica.Spec
-		record.SnapshotPath = replica.SnapshotPath
-		record.Status = replica.Status
-		record.Phase = replica.Phase
-		record.ArtifactID = replica.ArtifactID
-		record.LastJobID = replica.LastJobID
-		record.LastErrorPhase = replica.LastErrorPhase
-		record.CleanupRequired = replica.CleanupRequired
-		record.ErrorMessage = replica.ErrorMessage
-		return store.db.WithContext(ctx).Table(constants.TemplateReplicaTableName).Create(record).Error
+		return store.db.WithContext(ctx).Table(constants.TemplateReplicaTableName).
+			Create(replicaStatusToModel(templateID, instanceType, replica)).Error
 	}
-	return dbq.Updates(map[string]any{
-		"node_ip":          replica.NodeIP,
-		"instance_type":    instanceType,
-		"spec":             replica.Spec,
-		"snapshot_path":    replica.SnapshotPath,
-		"status":           replica.Status,
-		"phase":            replica.Phase,
-		"artifact_id":      replica.ArtifactID,
-		"last_job_id":      replica.LastJobID,
-		"last_error_phase": replica.LastErrorPhase,
-		"cleanup_required": replica.CleanupRequired,
-		"error_message":    replica.ErrorMessage,
-		"updated_at":       time.Now(),
-	}).Error
+	return dbq.Updates(replicaStatusUpdateFields(instanceType, replica)).Error
 }
 
 func EnsureReadyReplica(ctx context.Context, templateID string) error {
@@ -865,6 +914,24 @@ func EnsureReadyReplica(ctx context.Context, templateID string) error {
 		}
 	}
 	return ErrTemplateHasNoReadyReplica
+}
+
+func ResolveTemplateReadyReplica(ctx context.Context, templateID, preferredNodeID string) (ReplicaStatus, error) {
+	replicas, err := ListReplicas(ctx, templateID)
+	if err != nil {
+		return ReplicaStatus{}, err
+	}
+	preferredNodeID = strings.TrimSpace(preferredNodeID)
+	for _, item := range replicas {
+		replica := replicaModelToStatus(item)
+		if replica.Status != ReplicaStatusReady {
+			continue
+		}
+		if preferredNodeID == "" || strings.TrimSpace(replica.NodeID) == preferredNodeID {
+			return replica, nil
+		}
+	}
+	return ReplicaStatus{}, ErrTemplateHasNoReadyReplica
 }
 
 func EnsureTemplateLocalityReady(ctx context.Context, templateID, instanceType string) error {

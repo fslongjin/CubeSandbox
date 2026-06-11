@@ -35,6 +35,49 @@ require_cmd() {
   command -v "${cmd}" >/dev/null 2>&1 || die "required command not found: ${cmd}"
 }
 
+one_click_cow_required_commands() {
+  printf '%s\n' \
+    mkfs.ext4 \
+    mount \
+    umount \
+    losetup
+}
+
+cubelet_storage_backend_from_config() {
+  local config_path="$1"
+  ensure_file "${config_path}"
+  sed -nE 's/^[[:space:]]*storage_backend[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' "${config_path}" | head -n 1
+}
+
+validate_cubelet_cow_startup_deps() {
+  local config_path="$1"
+  ensure_file "${config_path}"
+  require_cmd sed
+
+  local storage_backend
+  storage_backend="$(cubelet_storage_backend_from_config "${config_path}")"
+  [[ "${storage_backend}" == "cubecow" ]] || return 0
+
+  local cmds=()
+  while IFS= read -r cmd; do
+    [[ -n "${cmd}" ]] && cmds+=("${cmd}")
+  done < <(one_click_cow_required_commands)
+
+  local missing=()
+  local cmd
+  for cmd in "${cmds[@]}"; do
+    if ! command -v "${cmd}" >/dev/null 2>&1; then
+      missing+=("${cmd}")
+    fi
+  done
+
+  if [[ "${#missing[@]}" -gt 0 ]]; then
+    die "cubelet cubecow startup dependency check failed for ${config_path}; missing commands in PATH: ${missing[*]} (required commands: ${cmds[*]})"
+  fi
+
+  log "cubelet cubecow startup dependencies OK: ${cmds[*]}"
+}
+
 require_root() {
   if [[ "${EUID}" -ne 0 ]]; then
     die "this script must run as root"
@@ -49,6 +92,50 @@ ensure_file() {
 ensure_dir() {
   local path="$1"
   [[ -d "${path}" ]] || die "required directory not found: ${path}"
+}
+
+ensure_not_directory_for_file() {
+  local path="$1"
+  if [[ ! -d "${path}" ]]; then
+    return 0
+  fi
+
+  if rmdir "${path}" 2>/dev/null; then
+    log "removed empty directory at file path: ${path}"
+    return 0
+  fi
+
+  die "expected file path is a non-empty directory: ${path}; move it away and retry"
+}
+
+prepare_file_output() {
+  local path="$1"
+  ensure_not_directory_for_file "${path}"
+  mkdir -p "$(dirname "${path}")"
+}
+
+ensure_bind_mount_file() {
+  local path="$1"
+  ensure_not_directory_for_file "${path}"
+  [[ -f "${path}" ]] || die "required bind mount source file not found: ${path}"
+}
+
+render_template_atomic() {
+  local template="$1"
+  local output="$2"
+  shift 2
+
+  ensure_file "${template}"
+  prepare_file_output "${output}"
+
+  local tmp="${output}.tmp.$$"
+  rm -f "${tmp}"
+  if ! sed "$@" "${template}" > "${tmp}"; then
+    rm -f "${tmp}"
+    die "failed to render template ${template} to ${output}"
+  fi
+  mv -f "${tmp}" "${output}"
+  ensure_bind_mount_file "${output}"
 }
 
 mkdir -p "${RUNTIME_DIR}" "${LOG_DIR}"
@@ -93,6 +180,30 @@ resolve_control_plane_cubemaster_addr() {
   fi
 
   die "ONE_CLICK_CONTROL_PLANE_IP or ONE_CLICK_CONTROL_PLANE_CUBEMASTER_ADDR is required for compute role"
+}
+
+command_output_has_exact_line() {
+  local needle="$1"
+  shift
+
+  require_cmd grep
+
+  local output
+  output="$("$@" 2>/dev/null || true)"
+  [[ -n "${output}" ]] || return 1
+  grep -Fxq -- "${needle}" <<<"${output}"
+}
+
+command_output_contains_fixed_string() {
+  local needle="$1"
+  shift
+
+  require_cmd grep
+
+  local output
+  output="$("$@" 2>/dev/null || true)"
+  [[ -n "${output}" ]] || return 1
+  grep -Fq -- "${needle}" <<<"${output}"
 }
 
 start_with_pidfile() {
@@ -145,7 +256,7 @@ pid_matches_pattern() {
     return 0
   fi
 
-  pgrep -f -- "${pattern}" | rg -x -- "${pid}" >/dev/null 2>&1
+  command_output_has_exact_line "${pid}" pgrep -f -- "${pattern}"
 }
 
 refresh_pidfile_from_pattern() {
@@ -213,7 +324,21 @@ stop_by_pidfile() {
 
 container_exists() {
   local name="$1"
-  docker ps -a --format '{{.Names}}' | rg -x "${name}" >/dev/null 2>&1
+  command_output_has_exact_line "${name}" docker ps -a --format '{{.Names}}'
+}
+
+docker_rm_if_exists() {
+  local name="$1"
+  local stop_timeout="${2:-10}"
+  if ! container_exists "${name}"; then
+    return 0
+  fi
+  # Graceful path: ask the container to stop, then remove it. We deliberately
+  # avoid `docker rm -f` (SIGKILL) so workloads like MySQL/Redis get to flush
+  # state. The systemd units that own these containers set TimeoutStopSec to
+  # cover this graceful stop.
+  docker stop -t "${stop_timeout}" "${name}" >/dev/null 2>&1 || true
+  docker rm "${name}" >/dev/null 2>&1 || true
 }
 
 wait_for_http() {

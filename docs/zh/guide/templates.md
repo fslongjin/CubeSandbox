@@ -2,8 +2,8 @@
 
 Template（模板）是 Cube-Sandbox 创建实例的基础镜像和配置快照。本页介绍模板的**概念与生命周期**。
 
-- 使用 CLI 创建、监控、查询或删除模板，请参阅[从 OCI 镜像制作模板](./template-from-image)。
-- 查看模板状态并预览最终请求，请参阅 [模板检查与请求预览](./template-inspection-and-preview)。
+- 使用 CLI 创建、监控、查询或删除模板，请参阅[从 OCI 镜像制作模板](./tutorials/template-from-image.md)。
+- 查看模板状态并预览最终请求，请参阅 [模板检查与请求预览](./template-inspection-and-preview.md)。
 
 ## 模板生命周期 (三步制作流程)
 
@@ -18,5 +18,5 @@ Template（模板）是 Cube-Sandbox 创建实例的基础镜像和配置快照�
 
 ## 下一步
 
-- [从 OCI 镜像制作模板](./template-from-image) — 完整的 CLI 指南，包括探针配置、进度监控和故障排查。
-- [模板检查与请求预览](./template-inspection-and-preview) — 如何查看模板状态并预览最终生效的请求。
+- [从 OCI 镜像制作模板](./tutorials/template-from-image.md) — 完整的 CLI 指南，包括探针配置、进度监控和故障排查。
+- [模板检查与请求预览](./template-inspection-and-preview.md) — 如何查看模板状态并预览最终生效的请求。

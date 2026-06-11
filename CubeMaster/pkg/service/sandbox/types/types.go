@@ -35,12 +35,12 @@ type HostChangeEvent struct {
 type CreateCubeSandboxReq struct {
 	*Request
 
-	Timeout       int            `json:"timeout,omitempty" d:"60"`
-	SnapshotDir   string         `json:"snapshot_dir,omitempty"`
-	InsId         string         `json:"ins_id,omitempty"`
-	InsIp         string         `json:"ins_ip,omitempty"`
-	Volumes       []*Volume      `json:"volumes,omitempty"`
-	CubeVSContext *CubeVSContext `json:"cubevs_context,omitempty"`
+	Timeout           int                `json:"timeout,omitempty" d:"60"`
+	SnapshotDir       string             `json:"snapshot_dir,omitempty"`
+	InsId             string             `json:"ins_id,omitempty"`
+	InsIp             string             `json:"ins_ip,omitempty"`
+	Volumes           []*Volume          `json:"volumes,omitempty"`
+	CubeNetworkConfig *CubeNetworkConfig `json:"cube_network_config,omitempty"`
 
 	Containers []*Container `json:"containers,omitempty"`
 
@@ -52,6 +52,31 @@ type CreateCubeSandboxReq struct {
 
 	RuntimeHandler string `json:"runtime_handler,omitempty"`
 	Namespace      string `json:"namespace,omitempty"`
+}
+
+func (r *CreateCubeSandboxReq) UnmarshalJSON(data []byte) error {
+	type rawCreateCubeSandboxReq CreateCubeSandboxReq
+	type requestIDEnvelope struct {
+		RequestID      string `json:"requestID"`
+		SnakeRequestID string `json:"request_id"`
+	}
+	var aux rawCreateCubeSandboxReq
+	if err := FastestJsoniter.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	var envelope requestIDEnvelope
+	if err := FastestJsoniter.Unmarshal(data, &envelope); err != nil {
+		return err
+	}
+	*r = CreateCubeSandboxReq(aux)
+	if r.Request == nil {
+		r.Request = &Request{}
+	}
+	r.RequestID = envelope.RequestID
+	if envelope.SnakeRequestID != "" {
+		r.RequestID = envelope.SnakeRequestID
+	}
+	return nil
 }
 
 type CreateCubeSandboxRes struct {
@@ -78,10 +103,43 @@ type RequestLimit struct {
 	Mem string `json:"mem,omitempty"`
 }
 
-type CubeVSContext struct {
-	AllowInternetAccess *bool    `json:"allowInternetAccess,omitempty"`
-	AllowOut            []string `json:"allowOut,omitempty"`
-	DenyOut             []string `json:"denyOut,omitempty"`
+type CubeNetworkConfig struct {
+	AllowInternetAccess *bool         `json:"allowInternetAccess,omitempty"`
+	AllowOut            []string      `json:"allowOut,omitempty"`
+	DenyOut             []string      `json:"denyOut,omitempty"`
+	Rules               []*EgressRule `json:"rules,omitempty"`
+}
+
+// EgressRule is an L7 egress rule, evaluated first-match-wins.
+type EgressRule struct {
+	Name   string            `json:"name"`
+	Match  *EgressRuleMatch  `json:"match,omitempty"`
+	Action *EgressRuleAction `json:"action,omitempty"`
+}
+
+// EgressRuleMatch holds the per-request match conditions for an EgressRule.
+// All fields are optional; an empty match matches any request.
+type EgressRuleMatch struct {
+	SNI    *string  `json:"sni,omitempty"`
+	Host   *string  `json:"host,omitempty"`
+	Method []string `json:"method,omitempty"`
+	Path   *string  `json:"path,omitempty"`
+	Scheme *string  `json:"scheme,omitempty"`
+}
+
+// EgressRuleAction holds the action taken when an EgressRule matches.
+type EgressRuleAction struct {
+	Allow  bool                `json:"allow"`
+	Audit  *string             `json:"audit,omitempty"`
+	Inject []*EgressRuleInject `json:"inject,omitempty"`
+}
+
+// EgressRuleInject is a credential injection. Honored when Action.Allow=true
+// and the request is HTTPS with matching SNI/Host (downstream enforces).
+type EgressRuleInject struct {
+	Header string  `json:"header"`
+	Secret string  `json:"secret"`
+	Format *string `json:"format,omitempty"`
 }
 
 type Volume struct {
@@ -363,6 +421,8 @@ type SandboxBriefData struct {
 	HostID      string            `json:"host_id,omitempty"`
 	HostIP      string            `json:"host_ip,omitempty"`
 	TemplateID  string            `json:"template_id,omitempty"`
+	CpuCount    int32             `json:"cpu_count,omitempty"`
+	MemoryMB    int32             `json:"memory_mb,omitempty"`
 	Annotations map[string]string `json:"annotations,omitempty"`
 	Labels      map[string]string `json:"labels,omitempty"`
 	NameSpace   string            `json:"namespace,omitempty"`
@@ -428,6 +488,7 @@ type ContainerOverrides struct {
 	Args            []string                  `json:"args,omitempty"`
 	WorkingDir      string                    `json:"working_dir,omitempty"`
 	Envs            []*KeyValue               `json:"envs,omitempty"`
+	DnsConfig       *DNSConfig                `json:"dns_config,omitempty"`
 	Resources       *Resource                 `json:"resources,omitempty"`
 	SecurityContext *ContainerSecurityContext `json:"security_context,omitempty"`
 	Probe           *Probe                    `json:"probe,omitempty"`
@@ -444,12 +505,22 @@ type CreateTemplateFromImageReq struct {
 	TemplateID         string              `json:"template_id,omitempty" p:"template_id"`
 	InstanceType       string              `json:"instance_type,omitempty"`
 	NetworkType        string              `json:"network_type,omitempty"`
-	CubeVSContext      *CubeVSContext      `json:"cubevs_context,omitempty"`
+	CubeNetworkConfig  *CubeNetworkConfig  `json:"cube_network_config,omitempty"`
 	WritableLayerSize  string              `json:"writable_layer_size,omitempty" p:"writable_layer_size" v:"required"`
 	ExposedPorts       []int32             `json:"exposed_ports,omitempty"`
 	DistributionScope  []string            `json:"distribution_scope,omitempty"`
 	ContainerOverrides *ContainerOverrides `json:"container_overrides,omitempty"`
 	Wait               bool                `json:"wait,omitempty"`
+
+	// WithCubeCA controls whether CubeMaster bakes the host-side
+	// CubeEgress root CA into the template's rootfs. *bool gives a
+	// three-state wire encoding so the CLI can ship a "default true"
+	// without ambiguating it with an explicit --with-cube-ca=false:
+	//   nil   → server-side default (true, see resolveWithCubeCA)
+	//   true  → bake; hard-error on missing CA file or distroless image
+	//   false → skip the bake entirely
+	// See design/cube-egress-ca-bake.md.
+	WithCubeCA *bool `json:"with_cube_ca,omitempty"`
 }
 
 type RedoTemplateFromImageReq struct {
@@ -478,6 +549,10 @@ type RootfsArtifactInfo struct {
 type TemplateImageJobInfo struct {
 	JobID                   string              `json:"job_id,omitempty"`
 	TemplateID              string              `json:"template_id,omitempty"`
+	RequestID               string              `json:"request_id,omitempty"`
+	SandboxID               string              `json:"sandbox_id,omitempty"`
+	ResourceType            string              `json:"resource_type,omitempty"`
+	ResourceID              string              `json:"resource_id,omitempty"`
 	AttemptNo               int32               `json:"attempt_no,omitempty"`
 	RetryOfJobID            string              `json:"retry_of_job_id,omitempty"`
 	Operation               string              `json:"operation,omitempty"`

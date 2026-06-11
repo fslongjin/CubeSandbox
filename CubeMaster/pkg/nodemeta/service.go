@@ -8,7 +8,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 
@@ -16,7 +18,9 @@ import (
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/constants"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/db"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/db/models"
+	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/log"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/node"
+	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/nodehealth"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/localcache"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -26,6 +30,17 @@ import (
 type ResourceSnapshot struct {
 	MilliCPU int64 `json:"milli_cpu,omitempty"`
 	MemoryMB int64 `json:"memory_mb,omitempty"`
+}
+
+// ComponentVersion mirrors the cubelet-side masterclient.ComponentVersion.
+// It carries the real version of one component installed on a node. Source is
+// one of "manifest" | "binary" | "file".
+type ComponentVersion struct {
+	Component string `json:"component"`
+	Version   string `json:"version,omitempty"`
+	Commit    string `json:"commit,omitempty"`
+	BuildTime string `json:"build_time,omitempty"`
+	Source    string `json:"source,omitempty"`
 }
 
 type ContainerImage struct {
@@ -44,19 +59,20 @@ type LocalTemplate struct {
 }
 
 type RegisterNodeRequest struct {
-	RequestID           string            `json:"requestID,omitempty"`
-	NodeID              string            `json:"node_id,omitempty"`
-	HostIP              string            `json:"host_ip,omitempty"`
-	GRPCPort            int               `json:"grpc_port,omitempty"`
-	Labels              map[string]string `json:"labels,omitempty"`
-	Capacity            ResourceSnapshot  `json:"capacity,omitempty"`
-	Allocatable         ResourceSnapshot  `json:"allocatable,omitempty"`
-	InstanceType        string            `json:"instance_type,omitempty"`
-	ClusterLabel        string            `json:"cluster_label,omitempty"`
-	QuotaCPU            int64             `json:"quota_cpu,omitempty"`
-	QuotaMemMB          int64             `json:"quota_mem_mb,omitempty"`
-	CreateConcurrentNum int64             `json:"create_concurrent_num,omitempty"`
-	MaxMvmNum           int64             `json:"max_mvm_num,omitempty"`
+	RequestID           string             `json:"requestID,omitempty"`
+	NodeID              string             `json:"node_id,omitempty"`
+	HostIP              string             `json:"host_ip,omitempty"`
+	GRPCPort            int                `json:"grpc_port,omitempty"`
+	Labels              map[string]string  `json:"labels,omitempty"`
+	Capacity            ResourceSnapshot   `json:"capacity,omitempty"`
+	Allocatable         ResourceSnapshot   `json:"allocatable,omitempty"`
+	InstanceType        string             `json:"instance_type,omitempty"`
+	ClusterLabel        string             `json:"cluster_label,omitempty"`
+	QuotaCPU            int64              `json:"quota_cpu,omitempty"`
+	QuotaMemMB          int64              `json:"quota_mem_mb,omitempty"`
+	CreateConcurrentNum int64              `json:"create_concurrent_num,omitempty"`
+	MaxMvmNum           int64              `json:"max_mvm_num,omitempty"`
+	Versions            []ComponentVersion `json:"versions,omitempty"`
 }
 
 type UpdateNodeStatusRequest struct {
@@ -65,6 +81,34 @@ type UpdateNodeStatusRequest struct {
 	Images         []ContainerImage       `json:"images,omitempty"`
 	LocalTemplates []LocalTemplate        `json:"local_templates,omitempty"`
 	HeartbeatTime  time.Time              `json:"heartbeat_time,omitempty"`
+
+	Allocated  *AllocatedResources `json:"allocated,omitempty"`
+	DiskUsage  *DiskUsage          `json:"disk_usage,omitempty"`
+	MetricTime time.Time           `json:"metric_time,omitempty"`
+
+	Versions []ComponentVersion `json:"versions,omitempty"`
+}
+
+// AllocatedResources is cubelet-side aggregation of sandbox-quota CPU /
+// memory / disk and counts for sandboxes currently held on the node. Field
+// naming aligns with the scheduler-facing Redis schema (RedisNodeInfo).
+type AllocatedResources struct {
+	MilliCPU      int64 `json:"milli_cpu,omitempty"`
+	MemoryMB      int64 `json:"memory_mb,omitempty"`
+	MvmNum        int64 `json:"mvm_num,omitempty"`
+	MvmRunningNum int64 `json:"mvm_running_num,omitempty"`
+	NicQueues     int64 `json:"nic_queues,omitempty"`
+
+	DataDiskMB    int64 `json:"data_disk_mb,omitempty"`
+	StorageDiskMB int64 `json:"storage_disk_mb,omitempty"`
+}
+
+// DiskUsage carries actual filesystem fill ratios observed by cubelet
+// (0~100). Each dimension is optional.
+type DiskUsage struct {
+	DataDiskUsagePer    float64 `json:"data_disk_usage_per,omitempty"`
+	StorageDiskUsagePer float64 `json:"storage_disk_usage_per,omitempty"`
+	SysDiskUsagePer     float64 `json:"sys_disk_usage_per,omitempty"`
 }
 
 type NodeSnapshot struct {
@@ -83,8 +127,14 @@ type NodeSnapshot struct {
 	Conditions          []corev1.NodeCondition `json:"conditions,omitempty"`
 	Images              []ContainerImage       `json:"images,omitempty"`
 	LocalTemplates      []LocalTemplate        `json:"local_templates,omitempty"`
+	Versions            []ComponentVersion     `json:"versions,omitempty"`
 	HeartbeatTime       time.Time              `json:"heartbeat_time,omitempty"`
-	Healthy             bool                   `json:"healthy,omitempty"`
+	ReportedReady       bool                   `json:"-"`
+	Healthy             bool                   `json:"healthy"`
+	UnhealthyReason     string                 `json:"unhealthy_reason,omitempty"`
+	// versionsHash is the content hash of Versions, used to skip redundant DB
+	// writes on every heartbeat. Not serialised to JSON.
+	versionsHash string
 }
 
 type service struct {
@@ -92,21 +142,33 @@ type service struct {
 	mu    sync.RWMutex
 	ready bool
 	nodes map[string]*NodeSnapshot
+
+	// declaredVersions is loaded once from the local release manifest during
+	// service startup. The manifest is deployed as an immutable release asset,
+	// so version-matrix reads should not parse it on every request.
+	declaredVersions    map[string]string
+	declaredVersionSets map[string]map[string]struct{}
+
+	// versionWriteLocks serialises the hash-check/write/update sequence per
+	// node so concurrent heartbeats cannot race each other and issue redundant
+	// version writes or overwrite a newer in-memory hash with an older one.
+	versionWriteLocks sync.Map
 }
 
 var global = &service{
-	nodes: make(map[string]*NodeSnapshot),
+	nodes:               make(map[string]*NodeSnapshot),
+	declaredVersions:    map[string]string{},
+	declaredVersionSets: map[string]map[string]struct{}{},
 }
 
 func Init(ctx context.Context) error {
 	_ = ctx
+	// Schema is owned by pkg/base/dao/migrate and applied at startup
+	// before any package Init runs.
 	global.db = db.Init(config.GetDbConfig())
-	if err := initRegistrationTable(global.db); err != nil {
-		return err
-	}
-	if err := initStatusTable(global.db); err != nil {
-		return err
-	}
+	declaredInfo := loadDeclaredVersionInfo()
+	global.declaredVersions = declaredInfo.Primary
+	global.declaredVersionSets = declaredInfo.Sets
 	if err := global.reload(); err != nil {
 		return err
 	}
@@ -122,7 +184,6 @@ func Ready() bool {
 }
 
 func RegisterNode(ctx context.Context, req *RegisterNodeRequest) (*NodeSnapshot, error) {
-	_ = ctx
 	if req == nil || req.NodeID == "" {
 		return nil, fmt.Errorf("node_id is required")
 	}
@@ -168,13 +229,14 @@ func RegisterNode(ctx context.Context, req *RegisterNodeRequest) (*NodeSnapshot,
 	snap.QuotaMemMB = req.QuotaMemMB
 	snap.CreateConcurrentNum = req.CreateConcurrentNum
 	snap.MaxMvmNum = req.MaxMvmNum
+	applyCurrentHealth(snap, time.Now())
 	global.mu.Unlock()
 	syncLocalcache(snap)
+	global.persistVersions(ctx, req.NodeID, req.Versions)
 	return cloneSnapshot(snap), nil
 }
 
 func UpdateNodeStatus(ctx context.Context, nodeID string, req *UpdateNodeStatusRequest) (*NodeSnapshot, error) {
-	_ = ctx
 	if nodeID == "" {
 		return nil, fmt.Errorf("node_id is required")
 	}
@@ -184,13 +246,14 @@ func UpdateNodeStatus(ctx context.Context, nodeID string, req *UpdateNodeStatusR
 	if req.HeartbeatTime.IsZero() {
 		req.HeartbeatTime = time.Now()
 	}
+	reportedReady := nodehealth.ReadyConditionTrue(req.Conditions)
 	status := &models.NodeStatus{
 		NodeID:             nodeID,
 		ConditionsJSON:     mustJSON(req.Conditions),
 		ImagesJSON:         mustJSON(req.Images),
 		LocalTemplatesJSON: mustJSON(req.LocalTemplates),
 		HeartbeatUnix:      req.HeartbeatTime.Unix(),
-		Healthy:            isHealthy(req.Conditions),
+		Healthy:            reportedReady,
 	}
 	if err := global.db.Clauses(clause.OnConflict{
 		Columns: []clause.Column{{Name: "node_id"}},
@@ -209,10 +272,162 @@ func UpdateNodeStatus(ctx context.Context, nodeID string, req *UpdateNodeStatusR
 	snap.Images = append([]ContainerImage(nil), req.Images...)
 	snap.LocalTemplates = append([]LocalTemplate(nil), req.LocalTemplates...)
 	snap.HeartbeatTime = req.HeartbeatTime
-	snap.Healthy = status.Healthy
+	snap.ReportedReady = reportedReady
+	applyCurrentHealth(snap, time.Now())
 	global.mu.Unlock()
 	syncLocalcache(snap)
+
+	// Resource metrics flow via Redis (shared across cubemaster replicas)
+	// and in-process cache (immediate visibility for this replica). They
+	// are intentionally not persisted to MySQL: every 10s heartbeat from
+	// hundreds of nodes would otherwise dominate write traffic, and Redis
+	// already provides the cross-replica fan-out used by the scheduler.
+	fanOutResourceMetric(ctx, nodeID, req)
+	global.persistVersions(ctx, nodeID, req.Versions)
 	return cloneSnapshot(snap), nil
+}
+
+// persistVersions records the node's component versions, skipping the DB
+// write entirely when the reported set is unchanged (content-hash compare
+// against the in-memory snapshot). This keeps the 10s heartbeat from turning
+// slow-changing version data into a MySQL write storm.
+func (s *service) persistVersions(ctx context.Context, nodeID string, versions []ComponentVersion) {
+	s.persistVersionsWithWriter(ctx, nodeID, versions, s.writeVersions)
+}
+
+func (s *service) persistVersionsWithWriter(
+	ctx context.Context,
+	nodeID string,
+	versions []ComponentVersion,
+	writer func(string, []ComponentVersion) error,
+) {
+	if len(versions) == 0 {
+		return
+	}
+	unlock := s.lockVersionWrite(nodeID)
+	defer unlock()
+	h := versionsHash(versions)
+	snap := s.ensureNode(nodeID)
+	s.mu.RLock()
+	unchanged := snap.versionsHash == h
+	s.mu.RUnlock()
+	if unchanged {
+		log.G(ctx).Debugf("version_write_skipped node=%s", nodeID)
+		return
+	}
+	if err := writer(nodeID, versions); err != nil {
+		log.G(ctx).Warnf("write node component versions failed for %s: %v", nodeID, err)
+		return
+	}
+	s.mu.Lock()
+	snap.Versions = append([]ComponentVersion(nil), versions...)
+	snap.versionsHash = h
+	s.mu.Unlock()
+	log.G(ctx).Debugf("version_write_applied node=%s components=%d", nodeID, len(versions))
+}
+
+func (s *service) lockVersionWrite(nodeID string) func() {
+	lockAny, _ := s.versionWriteLocks.LoadOrStore(nodeID, &sync.Mutex{})
+	lock := lockAny.(*sync.Mutex)
+	lock.Lock()
+	return lock.Unlock
+}
+
+// writeVersions upserts the reported component rows and physically removes
+// any component previously recorded for the node but absent from this report.
+// The table carries no soft-delete column, so Delete is a hard delete by
+// design (see models.NodeComponentVersion).
+func (s *service) writeVersions(nodeID string, versions []ComponentVersion) error {
+	now := time.Now().Unix()
+	rows := make([]*models.NodeComponentVersion, 0, len(versions))
+	keep := make([]string, 0, len(versions))
+	for _, v := range versions {
+		if v.Component == "" {
+			continue
+		}
+		rows = append(rows, &models.NodeComponentVersion{
+			NodeID:       nodeID,
+			Component:    v.Component,
+			Version:      v.Version,
+			Commit:       v.Commit,
+			BuildTime:    v.BuildTime,
+			Source:       v.Source,
+			ReportedUnix: now,
+		})
+		keep = append(keep, v.Component)
+	}
+	return s.db.Transaction(func(tx *gorm.DB) error {
+		if len(rows) > 0 {
+			if err := tx.Clauses(clause.OnConflict{
+				Columns: []clause.Column{{Name: "node_id"}, {Name: "component"}},
+				DoUpdates: clause.AssignmentColumns([]string{
+					"version", "commit", "build_time", "source", "reported_unix", "updated_at",
+				}),
+			}).Create(&rows).Error; err != nil {
+				return err
+			}
+		}
+		del := tx.Where("node_id = ?", nodeID)
+		if len(keep) > 0 {
+			del = del.Where("component NOT IN ?", keep)
+		}
+		return del.Delete(&models.NodeComponentVersion{}).Error
+	})
+}
+
+// versionsHash returns a stable content hash of the version set, order
+// independent (components are sorted first).
+func versionsHash(versions []ComponentVersion) string {
+	if len(versions) == 0 {
+		return ""
+	}
+	sorted := append([]ComponentVersion(nil), versions...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Component < sorted[j].Component })
+	h := fnv.New64a()
+	for _, v := range sorted {
+		fmt.Fprintf(h, "%s|%s|%s|%s|%s\n", v.Component, v.Version, v.Commit, v.BuildTime, v.Source)
+	}
+	return strconv.FormatUint(h.Sum64(), 16)
+}
+
+// fanOutResourceMetric is best-effort: write failures to Redis fall back
+// to in-process update so the receiving replica still schedules correctly,
+// and the next heartbeat (≤NodeStatusUpdateFrequency) reattempts the write.
+func fanOutResourceMetric(ctx context.Context, nodeID string, req *UpdateNodeStatusRequest) {
+	if req == nil || (req.Allocated == nil && req.DiskUsage == nil) {
+		return
+	}
+	metricTime := req.MetricTime
+	if metricTime.IsZero() {
+		metricTime = time.Now()
+	}
+	m := &localcache.NodeMetric{NodeID: nodeID, MetricTime: metricTime}
+	// HasAllocated / HasDisk track which sub-structures the cubelet
+	// actually populated, so the downstream writers can skip the other
+	// group entirely instead of overwriting it with zero values.
+	if a := req.Allocated; a != nil {
+		m.HasAllocated = true
+		m.MilliCPUUsage = a.MilliCPU
+		m.MemoryMBUsage = a.MemoryMB
+		m.MvmNum = a.MvmNum
+		m.NicQueues = a.NicQueues
+	}
+	if d := req.DiskUsage; d != nil {
+		m.HasDisk = true
+		m.DataDiskUsagePer = d.DataDiskUsagePer
+		m.StorageDiskUsagePer = d.StorageDiskUsagePer
+		m.SysDiskUsagePer = d.SysDiskUsagePer
+	}
+	if err := localcache.WriteNodeMetric(ctx, m); err != nil {
+		log.G(ctx).Warnf("write node metric to redis failed for %s: %v", nodeID, err)
+	}
+	if err := localcache.UpdateNodeMetricInProcess(m); err != nil {
+		// Missing in-process entry is normal during cold start (this
+		// replica has not yet reloaded the registration). Other replicas
+		// pick up the metric via Redis tick, and this one will converge
+		// on the next reload cycle.
+		log.G(ctx).Debugf("in-process metric update skipped for %s: %v", nodeID, err)
+	}
 }
 
 func GetNode(ctx context.Context, nodeID string) (*NodeSnapshot, error) {
@@ -223,7 +438,7 @@ func GetNode(ctx context.Context, nodeID string) (*NodeSnapshot, error) {
 	if !ok {
 		return nil, gorm.ErrRecordNotFound
 	}
-	return cloneSnapshot(snap), nil
+	return cloneSnapshotWithCurrentHealth(snap, time.Now()), nil
 }
 
 func ListNodes(ctx context.Context) ([]*NodeSnapshot, error) {
@@ -231,8 +446,9 @@ func ListNodes(ctx context.Context) ([]*NodeSnapshot, error) {
 	global.mu.RLock()
 	defer global.mu.RUnlock()
 	out := make([]*NodeSnapshot, 0, len(global.nodes))
+	now := time.Now()
 	for _, snap := range global.nodes {
-		out = append(out, cloneSnapshot(snap))
+		out = append(out, cloneSnapshotWithCurrentHealth(snap, now))
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].NodeID < out[j].NodeID })
 	return out, nil
@@ -301,7 +517,29 @@ func (s *service) reload() error {
 		_ = json.Unmarshal([]byte(st.ImagesJSON), &snap.Images)
 		_ = json.Unmarshal([]byte(st.LocalTemplatesJSON), &snap.LocalTemplates)
 		snap.HeartbeatTime = time.Unix(st.HeartbeatUnix, 0)
-		snap.Healthy = st.Healthy
+		snap.ReportedReady = st.Healthy
+		applyCurrentHealth(snap, time.Now())
+	}
+	versions := make([]*models.NodeComponentVersion, 0)
+	if err := s.db.Model(&models.NodeComponentVersion{}).Find(&versions).Error; err != nil {
+		return err
+	}
+	for _, v := range versions {
+		snap, ok := next[v.NodeID]
+		if !ok {
+			snap = &NodeSnapshot{NodeID: v.NodeID}
+			next[v.NodeID] = snap
+		}
+		snap.Versions = append(snap.Versions, ComponentVersion{
+			Component: v.Component,
+			Version:   v.Version,
+			Commit:    v.Commit,
+			BuildTime: v.BuildTime,
+			Source:    v.Source,
+		})
+	}
+	for _, snap := range next {
+		snap.versionsHash = versionsHash(snap.Versions)
 	}
 	s.mu.Lock()
 	s.nodes = next
@@ -309,66 +547,24 @@ func (s *service) reload() error {
 	return nil
 }
 
-func initRegistrationTable(client *gorm.DB) error {
-	if client.Migrator().HasTable(&models.NodeRegistration{}) {
-		return nil
-	}
-	stmt := &gorm.Statement{DB: client}
-	_ = stmt.Parse(&models.NodeRegistration{})
-	return client.Exec(`CREATE TABLE IF NOT EXISTS ` + stmt.Schema.Table + ` (
-		id bigint unsigned NOT NULL AUTO_INCREMENT,
-		node_id varchar(128) NOT NULL,
-		host_ip varchar(64) NOT NULL DEFAULT '',
-		grpc_port int NOT NULL DEFAULT '0',
-		labels_json longtext,
-		capacity_json text,
-		allocatable_json text,
-		instance_type varchar(64) NOT NULL DEFAULT '',
-		cluster_label varchar(128) NOT NULL DEFAULT '',
-		quota_cpu bigint NOT NULL DEFAULT '0',
-		quota_mem_mb bigint NOT NULL DEFAULT '0',
-		create_concurrent_num bigint NOT NULL DEFAULT '0',
-		max_mvm_num bigint NOT NULL DEFAULT '0',
-		created_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
-		updated_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
-		deleted_at datetime DEFAULT NULL,
-		PRIMARY KEY (id),
-		UNIQUE KEY idx_node_id (node_id),
-		KEY idx_host_ip (host_ip)
-	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb3`).Error
+func healthTimeout() time.Duration {
+	return nodehealth.MetadataTimeout(config.GetConfig().Common.SyncMetaDataInterval)
 }
 
-func initStatusTable(client *gorm.DB) error {
-	if client.Migrator().HasTable(&models.NodeStatus{}) {
-		return nil
+func currentHealthStatus(snap *NodeSnapshot, now time.Time) nodehealth.Status {
+	if snap == nil {
+		return nodehealth.Status{Healthy: false, UnhealthyReason: nodehealth.ReasonHeartbeatExpired}
 	}
-	stmt := &gorm.Statement{DB: client}
-	_ = stmt.Parse(&models.NodeStatus{})
-	return client.Exec(`CREATE TABLE IF NOT EXISTS ` + stmt.Schema.Table + ` (
-		id bigint unsigned NOT NULL AUTO_INCREMENT,
-		node_id varchar(128) NOT NULL,
-		conditions_json longtext,
-		images_json longtext,
-		local_templates_json longtext,
-		heartbeat_unix bigint NOT NULL DEFAULT '0',
-		healthy tinyint(1) NOT NULL DEFAULT '0',
-		created_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
-		updated_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
-		deleted_at datetime DEFAULT NULL,
-		PRIMARY KEY (id),
-		UNIQUE KEY idx_node_id (node_id),
-		KEY idx_heartbeat (heartbeat_unix),
-		KEY idx_healthy (healthy)
-	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb3`).Error
+	return nodehealth.EvaluateFromFacts(snap.ReportedReady, snap.HeartbeatTime, now, healthTimeout())
 }
 
-func isHealthy(conditions []corev1.NodeCondition) bool {
-	for _, cond := range conditions {
-		if cond.Type == corev1.NodeReady {
-			return cond.Status == corev1.ConditionTrue
-		}
+func applyCurrentHealth(snap *NodeSnapshot, now time.Time) {
+	if snap == nil {
+		return
 	}
-	return false
+	status := currentHealthStatus(snap, now)
+	snap.Healthy = status.Healthy
+	snap.UnhealthyReason = status.UnhealthyReason
 }
 
 func toSchedulerNode(snap *NodeSnapshot) *node.Node {
@@ -403,12 +599,19 @@ func toSchedulerNode(snap *NodeSnapshot) *node.Node {
 		OssClusterLabel:     snap.ClusterLabel,
 		InstanceType:        instanceType,
 		HostStatus:          constants.HostStatusRunning,
+		ReportedReady:       snap.ReportedReady,
 		Healthy:             snap.Healthy,
+		UnhealthyReason:     snap.UnhealthyReason,
 		CreateConcurrentNum: snap.CreateConcurrentNum,
 		MaxMvmLimit:         snap.MaxMvmNum,
 		MetaDataUpdateAt:    snap.HeartbeatTime,
-		MetricLocalUpdateAt: snap.HeartbeatTime,
-		MetricUpdate:        snap.HeartbeatTime,
+		// MetricUpdate / MetricLocalUpdateAt are intentionally left
+		// zero-valued here. They are owned by the resource-metric path
+		// (Redis tick or UpdateNodeMetricInProcess) so prefilter's
+		// MetricUpdateTimeout reflects metric freshness, not heartbeat
+		// freshness. A node with a fresh heartbeat but no metric will
+		// correctly be excluded by the timeout filter until cubelet
+		// reports usage.
 	}
 }
 
@@ -440,7 +643,14 @@ func cloneSnapshot(in *NodeSnapshot) *NodeSnapshot {
 	out.Conditions = append([]corev1.NodeCondition(nil), in.Conditions...)
 	out.Images = append([]ContainerImage(nil), in.Images...)
 	out.LocalTemplates = append([]LocalTemplate(nil), in.LocalTemplates...)
+	out.Versions = append([]ComponentVersion(nil), in.Versions...)
 	return &out
+}
+
+func cloneSnapshotWithCurrentHealth(in *NodeSnapshot, now time.Time) *NodeSnapshot {
+	out := cloneSnapshot(in)
+	applyCurrentHealth(out, now)
+	return out
 }
 
 func cloneStringMap(in map[string]string) map[string]string {

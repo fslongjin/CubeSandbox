@@ -26,13 +26,19 @@ const (
 	SandboxExecAction              = "/sandbox/exec"
 	SandboxUpdateAction            = "/sandbox/update"
 	SandboxCommitAction            = "/sandbox/commit"
+	SandboxRollbackAction          = "/sandbox/rollback"
+	SnapshotAction                 = "/snapshot"
+	SnapshotStorageAction          = "/snapshot/storage"
+	OperationAction                = "/operation"
 	TemplateAction                 = "/template"
 	TemplateRedoAction             = "/template/redo"
 	TemplateBuildStatusAction      = "/template/build"
 	TemplateFromImageAction        = "/template/from-image"
 	TemplateArtifactDownloadAction = "/template/artifact/download"
 	RootfsArtifactAction           = "/rootfs-artifact"
+	CADownloadActionPrefix         = "/ca/"
 	ListInventoryAction            = "/listinventory"
+	SandboxLogsAction              = "/sandbox/logs"
 )
 
 func CubeURI() string {
@@ -47,6 +53,14 @@ func HttpHandler(w http.ResponseWriter, r *http.Request) {
 	rt := CubeLog.GetTraceInfo(r.Context())
 	var rsp interface{}
 	switch {
+	case r.URL.Path == actionURI(SnapshotStorageAction):
+		rsp = handleSnapshotStorageAction(w, r, rt)
+	case strings.HasPrefix(r.URL.Path, actionURI(OperationAction)+"/"):
+		rsp = handleSnapshotOperationAction(w, r, rt)
+	case isSandboxRollbackResourcePath(r.URL.Path):
+		rsp = handleSandboxRollbackAction(w, r, rt)
+	case strings.HasPrefix(r.URL.Path, actionURI(SnapshotAction)+"/"):
+		rsp = handleSnapshotAction(w, r, rt)
 	case strings.HasPrefix(r.URL.Path, actionURI(TemplateBuildStatusAction)+"/"):
 		rsp = handleTemplateBuildStatusAction(w, r, rt)
 	case r.URL.Path == actionURI(SandboxPreviewAction):
@@ -61,10 +75,16 @@ func HttpHandler(w http.ResponseWriter, r *http.Request) {
 		rsp = handleInfoAction(w, r, rt)
 	case r.URL.Path == actionURI(SandboxExecAction):
 		rsp = handleExecAction(w, r, rt)
+	case r.URL.Path == actionURI(SandboxLogsAction):
+		rsp = handleSandboxLogsAction(w, r, rt)
 	case r.URL.Path == actionURI(SandboxUpdateAction):
 		rsp = handleUpdateAction(w, r, rt)
 	case r.URL.Path == actionURI(SandboxCommitAction):
 		rsp = handleSandboxCommitAction(w, r, rt)
+	case r.URL.Path == actionURI(SandboxRollbackAction):
+		rsp = handleSandboxRollbackAction(w, r, rt)
+	case r.URL.Path == actionURI(SnapshotAction):
+		rsp = handleSnapshotAction(w, r, rt)
 	case r.URL.Path == actionURI(TemplateAction):
 		rsp = handleTemplateAction(w, r, rt)
 	case r.URL.Path == actionURI(TemplateRedoAction):
@@ -73,6 +93,8 @@ func HttpHandler(w http.ResponseWriter, r *http.Request) {
 		rsp = handleTemplateFromImageAction(w, r, rt)
 	case r.URL.Path == actionURI(TemplateArtifactDownloadAction):
 		rsp = handleTemplateArtifactDownloadAction(w, r, rt)
+	case strings.HasPrefix(r.URL.Path, actionURI(CADownloadActionPrefix)):
+		rsp = handleCADownloadAction(w, r, rt)
 	case r.URL.Path == actionURI(RootfsArtifactAction):
 		rsp = handleRootfsArtifactAction(w, r, rt)
 	case r.URL.Path == actionURI(ListInventoryAction):
@@ -90,9 +112,20 @@ func HttpHandler(w http.ResponseWriter, r *http.Request) {
 		common.WriteListResponse(w, http.StatusOK, rsp)
 	} else if r.URL.Path == actionURI(TemplateArtifactDownloadAction) {
 		return
+	} else if strings.HasPrefix(r.URL.Path, actionURI(CADownloadActionPrefix)) && rsp == nil {
+		// handleCADownloadAction streamed the file via http.ServeContent;
+		// nothing left to write. On error paths it returned a *types.Res
+		// and we fall through to WriteResponse below.
+		return
 	} else {
 		common.WriteResponse(w, http.StatusOK, rsp)
 	}
+}
+
+func isSandboxRollbackResourcePath(path string) bool {
+	path = strings.Trim(strings.TrimSpace(path), "/")
+	parts := strings.Split(path, "/")
+	return len(parts) == 4 && parts[0] == strings.Trim(cubeURI, "/") && parts[1] == strings.Trim(SandboxAction, "/") && parts[3] == "rollback"
 }
 
 func getCaller(r *http.Request) string {

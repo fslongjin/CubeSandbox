@@ -60,11 +60,12 @@ is_stub_nameserver() {
 write_upstream_resolv_conf() {
   local src_path="$1"
   local dst_path="$2"
-  local tmp_path="${dst_path}.tmp"
+  local tmp_path="${dst_path}.tmp.$$"
   local found_nameserver=1
 
   [[ -f "${src_path}" ]] || return 1
 
+  prepare_file_output "${dst_path}"
   : > "${tmp_path}"
   while IFS= read -r line || [[ -n "${line}" ]]; do
     case "${line}" in
@@ -130,8 +131,11 @@ link_is_dummy() {
 ensure_resolved_link() {
   if link_exists "${RESOLVED_LINK_NAME}"; then
     link_is_dummy "${RESOLVED_LINK_NAME}" || die "existing link ${RESOLVED_LINK_NAME} is not a dummy link"
-  else
-    ip link add "${RESOLVED_LINK_NAME}" type dummy
+  elif ! ip link add "${RESOLVED_LINK_NAME}" type dummy; then
+    # CoreDNS and host DNS routing may start concurrently under systemd.
+    # If another helper created the link first, accept it after validation.
+    link_exists "${RESOLVED_LINK_NAME}" || die "failed to create dummy link ${RESOLVED_LINK_NAME}"
+    link_is_dummy "${RESOLVED_LINK_NAME}" || die "existing link ${RESOLVED_LINK_NAME} is not a dummy link"
   fi
 
   ip link set "${RESOLVED_LINK_NAME}" up
@@ -150,15 +154,19 @@ fi
 
 prepare_upstream_resolv_conf
 
-sed \
+render_template_atomic \
+  "${COREFILE_TEMPLATE}" \
+  "${COREFILE_PATH}" \
   -e "s/__CUBE_PROXY_DNS_ANSWER_IP__/${DNS_ANSWER_IP//\//\\/}/g" \
-  -e "s/__COREDNS_BIND_ADDR__/${COREDNS_BIND_ADDR//\//\\/}/g" \
-  "${COREFILE_TEMPLATE}" > "${COREFILE_PATH}"
+  -e "s/__COREDNS_BIND_ADDR__/${COREDNS_BIND_ADDR//\//\\/}/g"
 
-sed \
+render_template_atomic \
+  "${COREDNS_COMPOSE_TEMPLATE}" \
+  "${COREDNS_COMPOSE_FILE}" \
   -e "s/__COREDNS_CONTAINER__/${COREDNS_CONTAINER//\//\\/}/g" \
-  -e "s#__COREDNS_DIR__#${COREDNS_DIR//\//\\/}#g" \
-  "${COREDNS_COMPOSE_TEMPLATE}" > "${COREDNS_COMPOSE_FILE}"
+  -e "s#__COREDNS_DIR__#${COREDNS_DIR//\//\\/}#g"
+
+ensure_bind_mount_file "${RESOLV_UPSTREAM_PATH}"
 
 coredns_compose_run down --remove-orphans >/dev/null 2>&1 || true
 coredns_compose_run up -d coredns >/dev/null
@@ -211,27 +219,88 @@ install_dnsmasq() {
   command -v dnsmasq >/dev/null 2>&1 || die "failed to install dnsmasq for NetworkManager fallback"
 }
 
+# Wait until a UDP socket is bound on ip:port. Used after restarting
+# NetworkManager to confirm dnsmasq picked up the extended listen-address.
+wait_for_udp_listen() {
+  local ip="$1"
+  local port="$2"
+  local retries="${3:-30}"
+  local i
+  require_cmd ss
+  for ((i = 1; i <= retries; i++)); do
+    if ss -lnup "( sport = :${port} )" 2>/dev/null | grep -q -- "${ip}:${port}"; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+# Render /etc/resolv.conf so its only nameserver is the dummy-link IP
+# we just bound dnsmasq to, while preserving search/options pulled from
+# NetworkManager's non-stub snapshot. Docker daemon will then propagate
+# this non-loopback nameserver into every container it spawns.
+write_host_resolv_conf() {
+  local primary="$1"
+  local tmp="/etc/resolv.conf.cube-proxy.tmp"
+  local -a candidates=(
+    "/run/NetworkManager/no-stub-resolv.conf"
+    "/var/run/NetworkManager/no-stub-resolv.conf"
+    "/run/systemd/resolve/resolv.conf"
+    "/etc/resolv.conf"
+  )
+  : > "${tmp}"
+  printf 'nameserver %s\n' "${primary}" >> "${tmp}"
+  local src
+  for src in "${candidates[@]}"; do
+    [[ -f "${src}" ]] || continue
+    awk '/^(search|domain|options|sortlist) /' "${src}" >> "${tmp}"
+    break
+  done
+  install -m 0644 "${tmp}" /etc/resolv.conf
+  rm -f "${tmp}"
+}
+
 configure_with_networkmanager() {
   require_cmd systemctl
   networkmanager_available || die "NetworkManager is not available for DNS fallback"
 
   install_dnsmasq
 
+  # Reuse the same dummy link the resolvectl path uses, so dnsmasq has a
+  # stable, non-loopback IP that Docker can hand to every container.
+  ensure_resolved_link
+
   mkdir -p "${NM_CONF_DIR}" "${NM_DNSMASQ_DIR}"
 
+  # Keep NetworkManager driving dnsmasq, but take /etc/resolv.conf out of
+  # its hands (rc-manager=unmanaged). The default NM behavior would rewrite
+  # resolv.conf to "nameserver 127.0.0.1", which the Docker daemon treats as
+  # unreachable from inside containers and silently replaces with 8.8.8.8.
   cat > "${NM_MAIN_CONF}" <<EOF
 [main]
 dns=dnsmasq
+rc-manager=unmanaged
 EOF
 
+  # Make NM's dnsmasq bind both 127.0.0.1 (for host stub clients) and the
+  # dummy-link IP (for containers reaching us via the docker bridge gateway).
+  # bind-interfaces is required so dnsmasq honors listen-address strictly.
   cat > "${NM_DOMAIN_CONF}" <<EOF
+listen-address=127.0.0.1,${RESOLVED_COREDNS_BIND_ADDR}
+bind-interfaces
 server=/cube.app/${COREDNS_BIND_ADDR}#53
 EOF
 
   systemctl restart NetworkManager >/dev/null
 
+  wait_for_udp_listen "${RESOLVED_COREDNS_BIND_ADDR}" 53 30 || \
+    die "dnsmasq did not bind ${RESOLVED_COREDNS_BIND_ADDR}:53 after NetworkManager restart"
+  write_host_resolv_conf "${RESOLVED_COREDNS_BIND_ADDR}"
+
   printf 'networkmanager-dnsmasq\n' > "${DNS_MODE_FILE}"
-  log "cube proxy dns routed via NetworkManager dnsmasq fallback"
+  printf '%s\n' "${RESOLVED_LINK_NAME}" > "${DNS_IFACE_FILE}"
+  log "cube proxy dns routed via NetworkManager dnsmasq on dummy link ${RESOLVED_LINK_NAME}"
 }
 
 configure_with_fallback() {

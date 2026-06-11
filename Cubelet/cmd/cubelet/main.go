@@ -36,7 +36,9 @@ import (
 	"github.com/containerd/log"
 	"github.com/moby/sys/mountinfo"
 	"github.com/sirupsen/logrus"
+	"github.com/tencentcloud/CubeSandbox/Cubelet/network"
 	dynamConf "github.com/tencentcloud/CubeSandbox/Cubelet/pkg/config"
+	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/constants"
 	_ "github.com/tencentcloud/CubeSandbox/Cubelet/pkg/nsenter"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/utils"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/version"
@@ -59,11 +61,6 @@ const (
 	CubeMainProcMutexLock = "/run/cubelock.db"
 	networkPluginKey      = "io.cubelet.internal.v1.network"
 )
-
-type networkPluginBootstrapConfig struct {
-	EnableNetworkAgent   bool   `toml:"enable_network_agent"`
-	NetworkAgentEndpoint string `toml:"network_agent_endpoint"`
-}
 
 func main() {
 	if len(os.Args) > 1 {
@@ -161,9 +158,16 @@ func newCubeMnt() error {
 		cmd.Stdin = os.Stdin
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
+		// Use Cloneflags only (not Unshareflags) so that Go does not run
+		// its automatic post-unshare mount("none", "/", MS_REC|MS_PRIVATE)
+		// (see runtime.forkAndExecInChild1 in the Go stdlib). CLONE_NEWNS
+		// in Cloneflags still gives us a fresh mount namespace, and the
+		// kernel preserves the shared-propagation peer group relationship
+		// for mounts copied from the parent. That is a prerequisite for
+		// the subsequent `mount --make-rslave /` to slave this ns's root
+		// back to the host's shared group.
 		cmd.SysProcAttr = &syscall.SysProcAttr{
-			Cloneflags:   syscall.CLONE_NEWPID | syscall.CLONE_NEWNS,
-			Unshareflags: syscall.CLONE_NEWNS,
+			Cloneflags: syscall.CLONE_NEWPID | syscall.CLONE_NEWNS,
 		}
 		if err := cmd.Start(); err != nil {
 			newMntErr = fmt.Errorf("start newCubeMnt job error: %v", err)
@@ -189,6 +193,17 @@ func newCubeMnt() error {
 	cmds := [][]string{
 		{"mkdir", "-p", CubeShimTopdir},
 		{"mkdir", "-p", CubeShimSandboxes},
+		// Re-slave the root of cubelet's new mount namespace so that mount
+		// events happening in the host (init) namespace — e.g. operators
+		// mounting a new network storage volume after cubelet has started —
+		// propagate into this ns and become visible to prepareHostDirVolume.
+		// Without this, a freshly-added host mount is invisible here and
+		// any sandbox requesting a hostPath under it fails with ENOENT.
+		// Propagation is one-way (slave): mounts performed inside this ns
+		// (shim bind-mounts etc.) do not flow back to the host ns.
+		// Prerequisite: the host's "/" must be shared (true on systemd-based
+		// distros by default; our compute nodes confirm shared:1).
+		{"nsenter", "-t", fmt.Sprintf("%d", newMntPID), "-m", "mount", "--make-rslave", "/"},
 		{"nsenter", "-t", fmt.Sprintf("%d", newMntPID), "-m", "mount", "--bind", "--make-shared", CubeShimTopdir, CubeShimTopdir},
 		{"mkdir", "-p", CubeMntNsDirPath},
 		{"touch", CubeMntNsFilePath},
@@ -212,7 +227,7 @@ func init() {
 	grpclog.SetLoggerV2(grpclog.NewLoggerV2(io.Discard, io.Discard, io.Discard))
 
 	cli.VersionPrinter = func(c *cli.Context) {
-		fmt.Println(c.App.Name, c.App.Version)
+		fmt.Println(version.VersionString("cubelet"))
 	}
 }
 
@@ -312,6 +327,7 @@ func App() *cli.App {
 		if err := applyFlags(context, config); err != nil {
 			return err
 		}
+		ensureRequiredPlugins(config)
 
 		if networkCfg, ok, err := loadNetworkPluginBootstrapConfig(config); err != nil {
 			return err
@@ -504,19 +520,44 @@ func App() *cli.App {
 	return app
 }
 
-func loadNetworkPluginBootstrapConfig(cfg *srvconfig.Config) (*networkPluginBootstrapConfig, bool, error) {
+func ensureRequiredPlugins(config *srvconfig.Config) {
+	if config == nil || config.Config == nil {
+		return
+	}
+	required := map[string]struct{}{}
+	for _, id := range config.RequiredPlugins {
+		required[id] = struct{}{}
+	}
+	for _, id := range criticalCubeletPluginURIs() {
+		if _, ok := required[id]; ok {
+			continue
+		}
+		config.RequiredPlugins = append(config.RequiredPlugins, id)
+		required[id] = struct{}{}
+	}
+}
+
+func criticalCubeletPluginURIs() []string {
+	return []string{
+		string(constants.InternalPlugin) + "." + constants.StorageID.ID(),
+		string(constants.InternalPlugin) + "." + constants.CubeboxID.ID(),
+		string(constants.WorkflowPlugin) + "." + constants.WorkflowID.ID(),
+		string(constants.CubeboxServicePlugin) + "." + constants.CubeboxServiceID.ID(),
+	}
+}
+
+func loadNetworkPluginBootstrapConfig(cfg *srvconfig.Config) (*network.Config, bool, error) {
 	if cfg == nil || cfg.Plugins == nil {
 		return nil, false, nil
 	}
-	_, ok := cfg.Plugins[networkPluginKey]
-	if !ok {
+	if _, ok := cfg.Plugins[networkPluginKey]; !ok {
 		return nil, false, nil
 	}
-	var networkCfg networkPluginBootstrapConfig
-	if _, err := cfg.Decode(gocontext.Background(), networkPluginKey, &networkCfg); err != nil {
+	networkCfg := &network.Config{}
+	if _, err := cfg.Decode(gocontext.Background(), networkPluginKey, networkCfg); err != nil {
 		return nil, false, fmt.Errorf("decode %s plugin config: %w", networkPluginKey, err)
 	}
-	return &networkCfg, true, nil
+	return networkCfg, true, nil
 }
 
 func serve(ctx gocontext.Context, l net.Listener, serveFunc func(net.Listener) error) {

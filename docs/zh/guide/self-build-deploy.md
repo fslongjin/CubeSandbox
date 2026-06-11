@@ -1,6 +1,6 @@
 # 本地构建部署
 
-> 如果你希望跳过本地构建，直接开始体验，请参阅[快速开始](./quickstart)。
+> 如果你希望跳过本地构建，直接开始体验，请参阅[快速开始](./quickstart.md)。
 
 本指南介绍如何从源码构建 Cube Sandbox 发布包并在单台裸金属服务器上完成部署。本地构建部署适用于**评估体验、开发测试**场景，也是需要自定义组件或扩展计算节点时的起点。
 
@@ -28,7 +28,7 @@
 | Docker | 已安装并正常运行 |
 | root 权限 | `install.sh` 需要 root 执行 |
 | DNS 路由 | `systemd-resolved`（推荐）或 `NetworkManager + dnsmasq` |
-| `tar`、`rg`、`ss` | 安装脚本依赖 |
+| `tar`、`ss`、`grep`、`sed`、`awk` | 安装脚本依赖 |
 
 ### 软件要求（构建机）
 
@@ -142,17 +142,11 @@ sudo ./install.sh
 9. 启动宿主机进程：network-agent、cubemaster、cube-api、cubelet
 10. 执行健康检查（如 `ONE_CLICK_RUN_QUICKCHECK=1`）
 
-安装完成后，将命令行工具加入 PATH：
-
-```bash
-echo 'export PATH=/usr/local/services/cubetoolbox/CubeMaster/bin:$PATH' >> ~/.bashrc
-echo 'export PATH=/usr/local/services/cubetoolbox/Cubelet/bin:$PATH' >> ~/.bashrc
-source ~/.bashrc
-```
+安装完成后，安装器会把 `cubemastercli` 和 `cubecli` 软链接到 `/usr/local/bin`。
 
 #### 添加计算节点（多机集群）
 
-如果需要扩展到多台机器，可以添加计算节点并注册到本控制节点。完整操作请参阅[多机集群部署](./multi-node-deploy)指南。
+如果需要扩展到多台机器，可以添加计算节点并注册到本控制节点。完整操作请参阅[多机集群部署](./multi-node-deploy.md)指南。
 
 ## 验证部署
 
@@ -164,7 +158,7 @@ sudo ./smoke.sh
 
 该命令运行 `quickcheck.sh`，验证 `cube-api /health` 端点是否正常响应。
 
-计算节点的健康检查请参阅[多机集群部署 — 验证部署](./multi-node-deploy#验证部署)。
+计算节点的健康检查请参阅[多机集群部署 — 验证部署](./multi-node-deploy.md#验证部署)。
 
 ### 使用 E2B SDK 测试
 
@@ -173,8 +167,8 @@ sudo ./smoke.sh
 ```bash
 export CUBE_TEMPLATE_ID=<你的模板ID>
 export E2B_API_URL=http://<目标机IP>:3000
-export E2B_API_KEY=dummy
-export SSL_CERT_FILE=$(mkcert -CAROOT)/rootCA.pem
+export E2B_API_KEY=e2b_000000
+export SSL_CERT_FILE=/root/.local/share/mkcert/rootCA.pem
 ```
 
 | 变量 | 说明 |
@@ -187,6 +181,7 @@ export SSL_CERT_FILE=$(mkcert -CAROOT)/rootCA.pem
 **执行代码**
 
 ```python
+import os
 from e2b_code_interpreter import Sandbox
 
 template_id = os.environ["CUBE_TEMPLATE_ID"]
@@ -199,6 +194,7 @@ with Sandbox.create(template=template_id) as sandbox:
 **执行 Shell 命令**
 
 ```python
+import os
 from e2b_code_interpreter import Sandbox
 
 template_id = os.environ["CUBE_TEMPLATE_ID"]
@@ -211,6 +207,7 @@ with Sandbox.create(template=template_id) as sandbox:
 **读取沙箱内文件**
 
 ```python
+import os
 from e2b_code_interpreter import Sandbox
 
 template_id = os.environ["CUBE_TEMPLATE_ID"]
@@ -284,10 +281,12 @@ sudo ./down.sh
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `ONE_CLICK_DEPLOY_ROLE` | `control` | 部署角色：`control` 为单机部署（默认）。计算节点请参阅[多机集群部署](./multi-node-deploy) |
-| `ONE_CLICK_CONTROL_PLANE_IP` | 空 | 仅计算节点模式使用。详见[多机集群部署 — 配置环境变量](./multi-node-deploy#第二步配置环境变量) |
-| `ONE_CLICK_CONTROL_PLANE_CUBEMASTER_ADDR` | 空 | 仅计算节点模式使用。详见[多机集群部署 — 配置环境变量](./multi-node-deploy#第二步配置环境变量) |
+| `ONE_CLICK_DEPLOY_ROLE` | `control` | 部署角色：`control` 为单机部署（默认）。计算节点请参阅[多机集群部署](./multi-node-deploy.md) |
+| `ONE_CLICK_CONTROL_PLANE_IP` | 空 | 仅计算节点模式使用。详见[多机集群部署 — 配置环境变量](./multi-node-deploy.md#第二步配置环境变量) |
+| `ONE_CLICK_CONTROL_PLANE_CUBEMASTER_ADDR` | 空 | 仅计算节点模式使用。详见[多机集群部署 — 配置环境变量](./multi-node-deploy.md#第二步配置环境变量) |
 | `CUBE_SANDBOX_NODE_IP` | 自动从 `eth0` 探测 | 节点主网卡 IP 地址。未设置时自动探测；若网卡名称不同请显式指定。 |
+| `CUBE_SANDBOX_NETWORK_CIDR` | `192.168.0.0/18`（取自 `Cubelet/config/config.toml`） | cubevs 本地网络 CIDR，用于沙箱 IP 分配。格式为 IPv4 CIDR（如 `10.100.0.0/18`），掩码范围 /8~/30。安装时会自动检测是否与宿主机现有网络冲突。未设置时使用 `config.toml` 中的默认值。 |
+| `CUBE_SANDBOX_NETWORK_CIDR_SKIP_CONFLICT_CHECK` | `0` | 设为 `1` 可跳过 CIDR 冲突检测（不推荐）。与 `CUBE_SANDBOX_NETWORK_CIDR` 配合使用。 |
 | `ONE_CLICK_INSTALL_PREFIX` | `/usr/local/services/cubetoolbox` | 安装目录 |
 | `ONE_CLICK_RUN_QUICKCHECK` | `1` | 安装后是否执行健康检查 |
 | `ONE_CLICK_RUNTIME_DIR` | `/var/run/cube-sandbox-one-click` | PID 和运行时文件目录 |
@@ -317,8 +316,6 @@ sudo ./down.sh
 | `CUBE_PROXY_DNS_ANSWER_IP` | `${CUBE_SANDBOX_NODE_IP}` | CoreDNS 对 `cube.app` 返回的 IP |
 | `CUBE_PROXY_COREDNS_BIND_ADDR` | `127.0.0.54` | CoreDNS 绑定地址 |
 | `ONE_CLICK_MKCERT_BIN` | `assets/bin/mkcert`（内置） | 构建时自定义 mkcert 二进制路径 |
-| `ALPINE_MIRROR_URL` | 清华镜像 | CubeProxy 构建使用的 Alpine 软件源 |
-| `PIP_INDEX_URL` | 清华镜像 | CubeProxy 构建使用的 PyPI 源 |
 
 ### 进程监听地址
 
@@ -422,22 +419,6 @@ docker logs cube-sandbox-redis
 - 端口冲突（3306 或 6379 已被占用）
 - 磁盘空间不足
 - Docker 守护进程异常
-
-### ripgrep (`rg`) 未安装
-
-```
-Error: required command not found: rg
-```
-
-安装 ripgrep：
-
-```bash
-# Ubuntu/Debian
-sudo apt-get install ripgrep
-
-# CentOS/RHEL
-sudo yum install ripgrep
-```
 
 ## 已知限制
 

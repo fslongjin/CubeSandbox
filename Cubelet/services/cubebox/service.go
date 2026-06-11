@@ -29,6 +29,7 @@ import (
 	"github.com/tencentcloud/CubeSandbox/Cubelet/api/services/errorcode/v1"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/api/services/images/v1"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/constants"
+	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/cubelet/resourcesource"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/log"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/recov"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/ret"
@@ -145,6 +146,11 @@ func init() {
 					cubeboxMgr: cb,
 				},
 			}
+
+			// Publish the cubebox manager as the authoritative source of
+			// allocated-resource metrics so the cubelet heartbeat loop can
+			// pick it up without taking a hard dependency on this package.
+			resourcesource.Set(cb)
 
 			go func() {
 				CubeLog.Info("Start subscribing containerd event")
@@ -862,6 +868,47 @@ func scanDeadContainer(ctx context.Context, dc []*cubeboxstore.CubeBox, client *
 		})
 		if cb.FirstContainer() == nil {
 			continue
+		}
+		// Cubelet itself initiated the pause and already tracks the in-progress
+		// state via PausingAt (CONTAINER_PAUSING) or PausedAt (CONTAINER_PAUSED).
+		// Calling RecoverContainer -> shim state() while pause_vm() holds the
+		// sandbox mutex causes a ttrpc timeout; RecoverContainer then sets
+		// Unknown=true, making the sandbox appear Terminated and triggering a
+		// spurious Destroy cascade.
+		//
+		// The same race exists for snapshot rollback: while updateShimForRollback
+		// runs, the shim holds its sandbox mutex doing delete_vm +
+		// resume_vm_with_config and ttrpc state() either times out or returns
+		// task status=Unknown. RollbackSandbox sets RollingBack on every
+		// container's Status before invoking the shim and clears it via defer,
+		// so DeadGC must respect the flag for the same reason.
+		if status := cb.GetStatus(); status != nil {
+			st := status.Get()
+			if st.RollingBack {
+				continue
+			}
+			switch st.State() {
+			case cubebox.ContainerState_CONTAINER_PAUSED:
+				// User-driven pause: a legitimate, possibly long-lived state.
+				// Nothing for DeadGC to do.
+				continue
+			case cubebox.ContainerState_CONTAINER_PAUSING:
+				// PAUSING is meant to be a short transient. While a pause is
+				// genuinely in flight the shim holds its sandbox mutex, so a
+				// state() query would time out and stamp Unknown=true (see
+				// above) -- within the safety window we still skip. Past
+				// pausingStuckThreshold the pause is no longer running (e.g. the
+				// cubelet restarted mid-pause and missed both the RPC and
+				// /tasks/paused reconcile windows); reconcile once against the
+				// shim's real status so the sandbox never stays stuck at PAUSING
+				// forever.
+				if st.PausingAt == 0 ||
+					time.Since(time.Unix(0, st.PausingAt)) < pausingStuckThreshold {
+					continue
+				}
+				reconcileStuckPausingSandbox(ctx, client, cb)
+				continue
+			}
 		}
 		ctx = namespaces.WithNamespace(ctx, cb.Namespace)
 		ctr, err := cubes.RecoverContainer(ctx, client, cb, cb.FirstContainer())

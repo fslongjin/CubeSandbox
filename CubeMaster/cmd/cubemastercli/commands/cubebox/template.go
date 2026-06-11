@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"log"
 	"math/rand"
 	"net"
 	"net/http"
@@ -38,15 +39,18 @@ type templateReplicaStatus struct {
 }
 
 type templateResponse struct {
-	RequestID     string                      `json:"requestID,omitempty"`
-	Ret           *types.Ret                  `json:"ret,omitempty"`
-	TemplateID    string                      `json:"template_id,omitempty"`
-	InstanceType  string                      `json:"instance_type,omitempty"`
-	Version       string                      `json:"version,omitempty"`
-	Status        string                      `json:"status,omitempty"`
-	LastError     string                      `json:"last_error,omitempty"`
-	Replicas      []templateReplicaStatus     `json:"replicas,omitempty"`
-	CreateRequest *types.CreateCubeSandboxReq `json:"create_request,omitempty"`
+	RequestID                  string                      `json:"requestID,omitempty"`
+	Ret                        *types.Ret                  `json:"ret,omitempty"`
+	TemplateID                 string                      `json:"template_id,omitempty"`
+	InstanceType               string                      `json:"instance_type,omitempty"`
+	Version                    string                      `json:"version,omitempty"`
+	Status                     string                      `json:"status,omitempty"`
+	LastError                  string                      `json:"last_error,omitempty"`
+	Replicas                   []templateReplicaStatus     `json:"replicas,omitempty"`
+	CreateRequest              *types.CreateCubeSandboxReq `json:"create_request,omitempty"`
+	CubeEgressCABaked          bool                        `json:"cube_egress_ca_baked,omitempty"`
+	CubeEgressCAFingerprint    string                      `json:"cube_egress_ca_fingerprint,omitempty"`
+	CubeEgressCATargetsWritten int                         `json:"cube_egress_ca_targets_written,omitempty"`
 }
 
 type templateListResponse struct {
@@ -111,21 +115,21 @@ type templateDeleteRequest struct {
 	Sync         bool   `json:"sync,omitempty"`
 }
 
-func mergeCubeVSContextFlags(c *cli.Context, existing *types.CubeVSContext) *types.CubeVSContext {
+func mergeCubeNetworkConfigFlags(c *cli.Context, existing *types.CubeNetworkConfig) *types.CubeNetworkConfig {
 	hasAllowInternetAccess := c.IsSet("allow-internet-access")
 	allowOut := dedupeCIDRs(c.StringSlice("allow-out-cidr"))
 	denyOut := dedupeCIDRs(c.StringSlice("deny-out-cidr"))
-	return mergeCubeVSContextValues(existing, hasAllowInternetAccess, c.Bool("allow-internet-access"), allowOut, denyOut)
+	return mergeCubeNetworkConfigValues(existing, hasAllowInternetAccess, c.Bool("allow-internet-access"), allowOut, denyOut)
 }
 
-func mergeCubeVSContextValues(existing *types.CubeVSContext, hasAllowInternetAccess bool, allowInternetAccess bool, allowOut []string, denyOut []string) *types.CubeVSContext {
+func mergeCubeNetworkConfigValues(existing *types.CubeNetworkConfig, hasAllowInternetAccess bool, allowInternetAccess bool, allowOut []string, denyOut []string) *types.CubeNetworkConfig {
 	if !hasAllowInternetAccess && len(allowOut) == 0 && len(denyOut) == 0 {
 		return existing
 	}
 
-	out := cloneCubeVSContext(existing)
+	out := cloneCubeNetworkConfig(existing)
 	if out == nil {
-		out = &types.CubeVSContext{}
+		out = &types.CubeNetworkConfig{}
 	}
 	if hasAllowInternetAccess {
 		out.AllowInternetAccess = &allowInternetAccess
@@ -139,15 +143,15 @@ func mergeCubeVSContextValues(existing *types.CubeVSContext, hasAllowInternetAcc
 	return out
 }
 
-type createFromImageExtraCubeVSFlags struct {
+type createFromImageExtraNetworkFlags struct {
 	hasAllowInternetAccess bool
 	allowInternetAccess    bool
 	allowOut               []string
 	denyOut                []string
 }
 
-func mergeCreateFromImageCubeVSContextFlags(c *cli.Context, existing *types.CubeVSContext) (*types.CubeVSContext, error) {
-	extra, err := parseCreateFromImageExtraCubeVSFlags(c)
+func mergeCreateFromImageCubeNetworkConfigFlags(c *cli.Context, existing *types.CubeNetworkConfig) (*types.CubeNetworkConfig, error) {
+	extra, err := parseCreateFromImageExtraNetworkFlags(c)
 	if err != nil {
 		return nil, err
 	}
@@ -158,18 +162,18 @@ func mergeCreateFromImageCubeVSContextFlags(c *cli.Context, existing *types.Cube
 	}
 	allowOut := appendUniqueCIDRs(dedupeCIDRs(c.StringSlice("allow-out-cidr")), extra.allowOut)
 	denyOut := appendUniqueCIDRs(dedupeCIDRs(c.StringSlice("deny-out-cidr")), extra.denyOut)
-	return mergeCubeVSContextValues(existing, hasAllowInternetAccess, allowInternetAccess, allowOut, denyOut), nil
+	return mergeCubeNetworkConfigValues(existing, hasAllowInternetAccess, allowInternetAccess, allowOut, denyOut), nil
 }
 
-func parseCreateFromImageExtraCubeVSFlags(c *cli.Context) (*createFromImageExtraCubeVSFlags, error) {
+func parseCreateFromImageExtraNetworkFlags(c *cli.Context) (*createFromImageExtraNetworkFlags, error) {
 	extraArgs := make([]string, 0, c.NArg())
 	for i := 0; i < c.NArg(); i++ {
 		extraArgs = append(extraArgs, c.Args().Get(i))
 	}
 	if len(extraArgs) == 0 {
-		return &createFromImageExtraCubeVSFlags{}, nil
+		return &createFromImageExtraNetworkFlags{}, nil
 	}
-	extra := &createFromImageExtraCubeVSFlags{}
+	extra := &createFromImageExtraNetworkFlags{}
 	idx := 0
 
 	if c.IsSet("allow-internet-access") {
@@ -244,11 +248,11 @@ func parseBoolToken(value string) (bool, bool) {
 	}
 }
 
-func cloneCubeVSContext(in *types.CubeVSContext) *types.CubeVSContext {
+func cloneCubeNetworkConfig(in *types.CubeNetworkConfig) *types.CubeNetworkConfig {
 	if in == nil {
 		return nil
 	}
-	out := &types.CubeVSContext{
+	out := &types.CubeNetworkConfig{
 		AllowOut: append([]string(nil), in.AllowOut...),
 		DenyOut:  append([]string(nil), in.DenyOut...),
 	}
@@ -282,26 +286,26 @@ func appendUniqueCIDRs(base []string, extra []string) []string {
 	return out
 }
 
-func formatCubeVSContext(ctx *types.CubeVSContext) string {
-	if ctx == nil {
-		return "allow_internet_access=default(true) allow_out=[] deny_out=[]"
+func formatCubeNetworkConfig(cfg *types.CubeNetworkConfig) string {
+	if cfg == nil {
+		return "allow_internet_access=default(true) allow_out=[] deny_out=[] rules=0"
 	}
 	allow := "default(true)"
-	if ctx.AllowInternetAccess != nil {
-		allow = fmt.Sprintf("%t", *ctx.AllowInternetAccess)
+	if cfg.AllowInternetAccess != nil {
+		allow = fmt.Sprintf("%t", *cfg.AllowInternetAccess)
 	}
-	return fmt.Sprintf("allow_internet_access=%s allow_out=%v deny_out=%v", allow, ctx.AllowOut, ctx.DenyOut)
+	return fmt.Sprintf("allow_internet_access=%s allow_out=%v deny_out=%v rules=%d", allow, cfg.AllowOut, cfg.DenyOut, len(cfg.Rules))
 }
 
-func formatProtoCubeVSContext(ctx *api.CubeVSContext) string {
-	if ctx == nil {
-		return "allow_internet_access=default(true) allow_out=[] deny_out=[]"
+func formatProtoCubeNetworkConfig(cfg *api.CubeNetworkConfig) string {
+	if cfg == nil {
+		return "allow_internet_access=default(true) allow_out=[] deny_out=[] rules=0"
 	}
 	allow := "default(true)"
-	if ctx.AllowInternetAccess != nil {
-		allow = fmt.Sprintf("%t", ctx.GetAllowInternetAccess())
+	if cfg.AllowInternetAccess != nil {
+		allow = fmt.Sprintf("%t", cfg.GetAllowInternetAccess())
 	}
-	return fmt.Sprintf("allow_internet_access=%s allow_out=%v deny_out=%v", allow, ctx.GetAllowOut(), ctx.GetDenyOut())
+	return fmt.Sprintf("allow_internet_access=%s allow_out=%v deny_out=%v rules=%d", allow, cfg.GetAllowOut(), cfg.GetDenyOut(), len(cfg.GetRules()))
 }
 
 var TemplateCommand = cli.Command{
@@ -333,10 +337,6 @@ var TemplateCreateCommand = cli.Command{
 			Usage: "template create request json file",
 		},
 		cli.StringFlag{
-			Name:  "template-id",
-			Usage: "override template id in request annotations",
-		},
-		cli.StringFlag{
 			Name:  "version",
 			Value: "v2",
 			Usage: "template version annotation",
@@ -355,15 +355,15 @@ var TemplateCreateCommand = cli.Command{
 		},
 		cli.BoolFlag{
 			Name:  "allow-internet-access",
-			Usage: "set CubeVS allowInternetAccess for the template request",
+			Usage: "set allowInternetAccess on the network config for the template request",
 		},
 		cli.StringSliceFlag{
 			Name:  "allow-out-cidr",
-			Usage: "append an allowed egress CIDR to cubevs_context; repeat the flag to specify multiple CIDRs",
+			Usage: "append an allowed egress CIDR to cube_network_config; repeat the flag to specify multiple CIDRs",
 		},
 		cli.StringSliceFlag{
 			Name:  "deny-out-cidr",
-			Usage: "append a denied egress CIDR to cubevs_context; repeat the flag to specify multiple CIDRs",
+			Usage: "append a denied egress CIDR to cube_network_config; repeat the flag to specify multiple CIDRs",
 		},
 		cli.BoolFlag{
 			Name:  "json",
@@ -394,12 +394,6 @@ var TemplateCreateCommand = cli.Command{
 		if req.Annotations == nil {
 			req.Annotations = map[string]string{}
 		}
-		if templateID := c.String("template-id"); templateID != "" {
-			req.Annotations[constants.CubeAnnotationAppSnapshotTemplateID] = templateID
-		}
-		if req.Annotations[constants.CubeAnnotationAppSnapshotTemplateID] == "" {
-			return errors.New("template-id is required, either in request file or flag")
-		}
 		req.Annotations[constants.CubeAnnotationsAppSnapshotCreate] = "true"
 		version := c.String("version")
 		if version != "" {
@@ -415,11 +409,11 @@ var TemplateCreateCommand = cli.Command{
 		if scope := c.StringSlice("node"); len(scope) > 0 {
 			req.DistributionScope = scope
 		}
-		req.CubeVSContext = mergeCubeVSContextFlags(c, req.CubeVSContext)
+		req.CubeNetworkConfig = mergeCubeNetworkConfigFlags(c, req.CubeNetworkConfig)
 
 		serverList = getServerAddrs(c)
 		if len(serverList) == 0 {
-			myPrint("no server addr")
+			log.Printf("no server addr\n")
 			return errors.New("no server addr")
 		}
 		port = c.GlobalString("port")
@@ -431,14 +425,14 @@ var TemplateCreateCommand = cli.Command{
 		}
 		rsp := &templateResponse{}
 		if err = doHttpReq(c, url, http.MethodPost, req.RequestID, bytes.NewBuffer(body), rsp); err != nil {
-			myPrint("template create request err. %s. RequestId: %s", err.Error(), req.RequestID)
+			log.Printf("template create request err. %s. RequestId: %s\n", err.Error(), req.RequestID)
 			return err
 		}
 		if rsp.Ret == nil {
 			return errors.New("empty response")
 		}
 		if rsp.Ret.RetCode != 200 {
-			myPrint("template create failed. %s. RequestId: %s", rsp.Ret.RetMsg, req.RequestID)
+			log.Printf("template create failed. %s. RequestId: %s\n", rsp.Ret.RetMsg, req.RequestID)
 			return errors.New(rsp.Ret.RetMsg)
 		}
 		if c.Bool("json") {
@@ -475,7 +469,7 @@ var TemplateInfoCommand = cli.Command{
 
 		serverList = getServerAddrs(c)
 		if len(serverList) == 0 {
-			myPrint("no server addr")
+			log.Printf("no server addr\n")
 			return errors.New("no server addr")
 		}
 		port = c.GlobalString("port")
@@ -488,14 +482,14 @@ var TemplateInfoCommand = cli.Command{
 
 		rsp := &templateResponse{}
 		if err := doHttpReq(c, url, http.MethodGet, requestID, nil, rsp); err != nil {
-			myPrint("template info request err. %s. RequestId: %s", err.Error(), requestID)
+			log.Printf("template info request err. %s. RequestId: %s\n", err.Error(), requestID)
 			return err
 		}
 		if rsp.Ret == nil {
 			return errors.New("empty response")
 		}
 		if rsp.Ret.RetCode != 200 {
-			myPrint("template info failed. %s. RequestId: %s", rsp.Ret.RetMsg, requestID)
+			log.Printf("template info failed. %s. RequestId: %s\n", rsp.Ret.RetMsg, requestID)
 			return errors.New(rsp.Ret.RetMsg)
 		}
 		if c.Bool("json") {
@@ -558,7 +552,7 @@ var TemplateRenderCommand = cli.Command{
 
 		serverList = getServerAddrs(c)
 		if len(serverList) == 0 {
-			myPrint("no server addr")
+			log.Printf("no server addr\n")
 			return errors.New("no server addr")
 		}
 		port = c.GlobalString("port")
@@ -571,14 +565,14 @@ var TemplateRenderCommand = cli.Command{
 		}
 		rsp := &sandboxPreviewResponse{}
 		if err = doHttpReq(c, url, http.MethodPost, req.RequestID, bytes.NewBuffer(body), rsp); err != nil {
-			myPrint("template render request err. %s. RequestId: %s", err.Error(), req.RequestID)
+			log.Printf("template render request err. %s. RequestId: %s\n", err.Error(), req.RequestID)
 			return err
 		}
 		if rsp.Ret == nil {
 			return errors.New("empty response")
 		}
 		if rsp.Ret.RetCode != 200 {
-			myPrint("template render failed. %s. RequestId: %s", rsp.Ret.RetMsg, req.RequestID)
+			log.Printf("template render failed. %s. RequestId: %s\n", rsp.Ret.RetMsg, req.RequestID)
 			return errors.New(rsp.Ret.RetMsg)
 		}
 		if c.Bool("json") {
@@ -625,17 +619,17 @@ var TemplateDeleteCommand = cli.Command{
 
 		rsp := &templateResponse{}
 		if err := doHttpReq(c, url, http.MethodDelete, requestID, bytes.NewBuffer(body), rsp); err != nil {
-			myPrint("template delete request err. %s. RequestId: %s", err.Error(), requestID)
+			log.Printf("template delete request err. %s. RequestId: %s\n", err.Error(), requestID)
 			return err
 		}
 		if rsp.Ret == nil {
 			return errors.New("empty response")
 		}
 		if rsp.Ret.RetCode != 200 {
-			myPrint("template delete failed. %s. RequestId: %s", rsp.Ret.RetMsg, requestID)
+			log.Printf("template delete failed. %s. RequestId: %s\n", rsp.Ret.RetMsg, requestID)
 			return errors.New(rsp.Ret.RetMsg)
 		}
-		fmt.Printf("template deleted: %s\n", templateID)
+		log.Printf("template deleted: %s\n", templateID)
 		return nil
 	},
 }
@@ -649,24 +643,20 @@ var TemplateCommitCommand = cli.Command{
 			Usage: "sandbox id to commit",
 		},
 		cli.StringFlag{
-			Name:  "template-id",
-			Usage: "target template id",
-		},
-		cli.StringFlag{
 			Name:  "file, f",
 			Usage: "original create_sandbox request json file",
 		},
 		cli.BoolFlag{
 			Name:  "allow-internet-access",
-			Usage: "set CubeVS allowInternetAccess for the create_request",
+			Usage: "set allowInternetAccess on the network config for the create_request",
 		},
 		cli.StringSliceFlag{
 			Name:  "allow-out-cidr",
-			Usage: "append an allowed egress CIDR to create_request.cubevs_context; repeat the flag to specify multiple CIDRs",
+			Usage: "append an allowed egress CIDR to create_request.cube_network_config; repeat the flag to specify multiple CIDRs",
 		},
 		cli.StringSliceFlag{
 			Name:  "deny-out-cidr",
-			Usage: "append a denied egress CIDR to create_request.cubevs_context; repeat the flag to specify multiple CIDRs",
+			Usage: "append a denied egress CIDR to create_request.cube_network_config; repeat the flag to specify multiple CIDRs",
 		},
 		cli.BoolFlag{
 			Name:  "json",
@@ -675,13 +665,12 @@ var TemplateCommitCommand = cli.Command{
 	},
 	Action: func(c *cli.Context) error {
 		sandboxID := c.String("sandbox-id")
-		templateID := c.String("template-id")
 		filePath := c.String("file")
 		if filePath == "" && c.NArg() > 0 {
 			filePath = c.Args().First()
 		}
-		if sandboxID == "" || templateID == "" || filePath == "" {
-			return errors.New("sandbox-id, template-id and file are required")
+		if sandboxID == "" || filePath == "" {
+			return errors.New("sandbox-id and file are required")
 		}
 
 		reqBytes, err := getParams(filePath)
@@ -700,13 +689,11 @@ var TemplateCommitCommand = cli.Command{
 		if createReq.Annotations == nil {
 			createReq.Annotations = map[string]string{}
 		}
-		createReq.Annotations[constants.CubeAnnotationAppSnapshotTemplateID] = templateID
-		createReq.CubeVSContext = mergeCubeVSContextFlags(c, createReq.CubeVSContext)
+		createReq.CubeNetworkConfig = mergeCubeNetworkConfigFlags(c, createReq.CubeNetworkConfig)
 
 		req := &templateCommitRequest{
 			RequestID:     requestID,
 			SandboxID:     sandboxID,
-			TemplateID:    templateID,
 			CreateRequest: createReq,
 		}
 
@@ -724,22 +711,22 @@ var TemplateCommitCommand = cli.Command{
 
 		rsp := &templateCommitResponse{}
 		if err = doHttpReq(c, url, http.MethodPost, requestID, bytes.NewBuffer(body), rsp); err != nil {
-			myPrint("template commit request err. %s. RequestId: %s", err.Error(), requestID)
+			log.Printf("template commit request err. %s. RequestId: %s\n", err.Error(), requestID)
 			return err
 		}
 		if rsp.Ret == nil {
 			return errors.New("empty response")
 		}
 		if rsp.Ret.RetCode != 200 {
-			myPrint("template commit failed. %s. RequestId: %s", rsp.Ret.RetMsg, requestID)
+			log.Printf("template commit failed. %s. RequestId: %s\n", rsp.Ret.RetMsg, requestID)
 			return errors.New(rsp.Ret.RetMsg)
 		}
 		if c.Bool("json") {
 			commands.PrintAsJSON(rsp)
 			return nil
 		}
-		fmt.Printf("template_id: %s\n", rsp.TemplateID)
-		fmt.Printf("build_id: %s\n", rsp.BuildID)
+		log.Printf("template_id: %s\n", rsp.TemplateID)
+		log.Printf("build_id: %s\n", rsp.BuildID)
 		return nil
 	},
 }
@@ -749,25 +736,26 @@ var TemplateCreateFromImageCommand = cli.Command{
 	Usage: "build ext4 rootfs from OCI image and create template asynchronously",
 	Flags: []cli.Flag{
 		cli.StringFlag{Name: "image", Usage: "source OCI image reference"},
-		cli.StringFlag{Name: "template-id", Usage: "template id, optional when cubemaster auto-generates one"},
 		cli.StringFlag{Name: "writable-layer-size", Usage: "immutable writable layer size, e.g. 20Gi"},
 		cli.StringSliceFlag{Name: "expose-port", Usage: "container port to expose for the template; repeat the flag to specify multiple ports"},
 		cli.StringFlag{Name: "instance-type", Value: "cubebox", Usage: "instance type"},
 		cli.StringFlag{Name: "network-type", Value: "tap", Usage: "network type"},
 		cli.StringSliceFlag{Name: "node", Usage: "create template only on the specified node id or host ip; repeat to specify multiple nodes"},
-		cli.BoolFlag{Name: "allow-internet-access", Usage: "set CubeVS allowInternetAccess for the generated template request"},
-		cli.StringSliceFlag{Name: "allow-out-cidr", Usage: "append an allowed egress CIDR to cubevs_context; repeat the flag to specify multiple CIDRs"},
-		cli.StringSliceFlag{Name: "deny-out-cidr", Usage: "append a denied egress CIDR to cubevs_context; repeat the flag to specify multiple CIDRs"},
+		cli.BoolFlag{Name: "allow-internet-access", Usage: "set allowInternetAccess on the network config for the generated template request"},
+		cli.StringSliceFlag{Name: "allow-out-cidr", Usage: "append an allowed egress CIDR to cube_network_config; repeat the flag to specify multiple CIDRs"},
+		cli.StringSliceFlag{Name: "deny-out-cidr", Usage: "append a denied egress CIDR to cube_network_config; repeat the flag to specify multiple CIDRs"},
 		cli.StringFlag{Name: "registry-username", Usage: "registry username"},
 		cli.StringFlag{Name: "registry-password", Usage: "registry password"},
 
 		cli.StringSliceFlag{Name: "cmd", Usage: "override container ENTRYPOINT (command); repeat for multiple elements, e.g. --cmd /bin/sh --cmd -c"},
 		cli.StringSliceFlag{Name: "arg", Usage: "override container CMD (args); repeat for multiple elements"},
 		cli.StringSliceFlag{Name: "env", Usage: "set environment variable, KEY=VALUE format; repeat for multiple envs"},
+		cli.StringSliceFlag{Name: "dns", Usage: "set container DNS nameserver; repeat for multiple servers"},
 		cli.IntFlag{Name: "probe", Usage: "enable HTTP GET probe on the specified port (e.g. --probe 9000); sets timeout_ms=30000, period_ms=500"},
 		cli.StringFlag{Name: "probe-path", Value: "/health", Usage: "HTTP path for the readiness probe (default: /health); only effective when --probe is set"},
 		cli.IntFlag{Name: "cpu", Value: 2000, Usage: "CPU millicores for the template container (default: 2000, i.e. 2 cores)"},
 		cli.IntFlag{Name: "memory", Value: 2000, Usage: "Memory for the template container in MB (default: 2000 MB)"},
+		cli.BoolTFlag{Name: "with-cube-ca", Usage: "bake the CubeEgress root CA at /etc/cube/ca/cube-root-ca.crt into the template rootfs so sandboxes trust CubeEgress's MITM. Pass --with-cube-ca=false to skip (default: true)"},
 		cli.BoolFlag{Name: "json", Usage: "print raw json response"},
 	},
 	Action: func(c *cli.Context) error {
@@ -792,9 +780,9 @@ var TemplateCreateFromImageCommand = cli.Command{
 			return err
 		}
 		req := &types.CreateTemplateFromImageReq{
-			Request:            &types.Request{RequestID: uuid.New().String()},
-			SourceImageRef:     c.String("image"),
-			TemplateID:         c.String("template-id"),
+			Request:        &types.Request{RequestID: uuid.New().String()},
+			SourceImageRef: c.String("image"),
+			// TemplateID is auto-generated by normalizeTemplateImageRequest.
 			WritableLayerSize:  c.String("writable-layer-size"),
 			DistributionScope:  c.StringSlice("node"),
 			ExposedPorts:       exposedPorts,
@@ -804,7 +792,12 @@ var TemplateCreateFromImageCommand = cli.Command{
 			RegistryPassword:   c.String("registry-password"),
 			ContainerOverrides: containerOverrides,
 		}
-		req.CubeVSContext, err = mergeCreateFromImageCubeVSContextFlags(c, req.CubeVSContext)
+		// --with-cube-ca defaults true (BoolTFlag). We always materialise
+		// the *bool on the wire so non-CLI callers (HTTP clients, future
+		// SDKs) can still rely on `nil = server-side default`.
+		withCubeCA := c.BoolT("with-cube-ca")
+		req.WithCubeCA = &withCubeCA
+		req.CubeNetworkConfig, err = mergeCreateFromImageCubeNetworkConfigFlags(c, req.CubeNetworkConfig)
 		if err != nil {
 			return err
 		}
@@ -890,12 +883,18 @@ var TemplateRedoCommand = cli.Command{
 			if err != nil {
 				return err
 			}
-			current := fmt.Sprintf("%s/%s/%d/%d/%d", latest.Job.Status, latest.Job.Phase, latest.Job.Progress, latest.Job.ReadyNodeCount, latest.Job.ExpectedNodeCount)
+			if latest.Job == nil {
+				printTemplateImageJobWatchLine(nil)
+				printTemplateImageJobCompletionSummary(nil)
+				return errors.New("empty job")
+			}
+			current := formatTemplateImageJobWatchLine(latest.Job)
 			if current != lastPrinted {
-				printTemplateImageJob(latest.Job)
+				printTemplateImageJobWatchLine(latest.Job)
 				lastPrinted = current
 			}
 			if latest.Job.Status == "READY" || latest.Job.Status == "FAILED" {
+				printTemplateImageJobCompletionSummary(latest.Job)
 				if c.Bool("json") {
 					commands.PrintAsJSON(latest)
 				}
@@ -953,12 +952,18 @@ var TemplateWatchCommand = cli.Command{
 			if err != nil {
 				return err
 			}
-			current := fmt.Sprintf("%s/%s/%d/%d/%d", rsp.Job.Status, rsp.Job.Phase, rsp.Job.Progress, rsp.Job.ReadyNodeCount, rsp.Job.ExpectedNodeCount)
+			if rsp.Job == nil {
+				printTemplateImageJobWatchLine(nil)
+				printTemplateImageJobCompletionSummary(nil)
+				return errors.New("empty job")
+			}
+			current := formatTemplateImageJobWatchLine(rsp.Job)
 			if current != lastPrinted {
-				printTemplateImageJob(rsp.Job)
+				printTemplateImageJobWatchLine(rsp.Job)
 				lastPrinted = current
 			}
 			if rsp.Job.Status == "READY" || rsp.Job.Status == "FAILED" {
+				printTemplateImageJobCompletionSummary(rsp.Job)
 				if c.Bool("json") {
 					commands.PrintAsJSON(rsp)
 				}
@@ -1052,7 +1057,7 @@ var TemplateListCommand = cli.Command{
 	Action: func(c *cli.Context) error {
 		serverList = getServerAddrs(c)
 		if len(serverList) == 0 {
-			myPrint("no server addr")
+			log.Printf("no server addr\n")
 			return errors.New("no server addr")
 		}
 		port = c.GlobalString("port")
@@ -1062,14 +1067,14 @@ var TemplateListCommand = cli.Command{
 
 		rsp := &templateListResponse{}
 		if err := doHttpReq(c, url, http.MethodGet, requestID, nil, rsp); err != nil {
-			myPrint("template list request err. %s. RequestId: %s", err.Error(), requestID)
+			log.Printf("template list request err. %s. RequestId: %s\n", err.Error(), requestID)
 			return err
 		}
 		if rsp.Ret == nil {
 			return errors.New("empty response")
 		}
 		if rsp.Ret.RetCode != 200 {
-			myPrint("template list failed. %s. RequestId: %s", rsp.Ret.RetMsg, requestID)
+			log.Printf("template list failed. %s. RequestId: %s\n", rsp.Ret.RetMsg, requestID)
 			return errors.New(rsp.Ret.RetMsg)
 		}
 		if c.Bool("json") {
@@ -1097,46 +1102,67 @@ var TemplateListCommand = cli.Command{
 }
 
 func printTemplateSummary(rsp *templateResponse) {
-	fmt.Printf("template_id: %s\n", rsp.TemplateID)
-	fmt.Printf("instance_type: %s\n", rsp.InstanceType)
-	fmt.Printf("version: %s\n", rsp.Version)
-	fmt.Printf("status: %s\n", rsp.Status)
+	log.Printf("template_id: %s\n", rsp.TemplateID)
+	log.Printf("instance_type: %s\n", rsp.InstanceType)
+	log.Printf("version: %s\n", rsp.Version)
+	log.Printf("status: %s\n", rsp.Status)
 	if rsp.LastError != "" {
-		fmt.Printf("last_error: %s\n", rsp.LastError)
+		log.Printf("last_error: %s\n", rsp.LastError)
 	}
+	// CubeEgress CA bake status. Always print so an operator can tell
+	// at a glance whether sandboxes from this template will trust
+	// CubeEgress's MITM certs. baked=false on a deployment that ships
+	// CubeEgress is a yellow flag worth investigating (most likely a
+	// distroless image that didn't have a ca-bundle to update).
+	log.Printf("cube_egress_ca: baked=%t fingerprint=%s targets_written=%d\n",
+		rsp.CubeEgressCABaked, fingerprintShortOrEmpty(rsp.CubeEgressCAFingerprint), rsp.CubeEgressCATargetsWritten)
 	if rsp.CreateRequest != nil {
-		fmt.Printf("cubevs_context: %s\n", formatCubeVSContext(rsp.CreateRequest.CubeVSContext))
+		log.Printf("cube_network_config: %s\n", formatCubeNetworkConfig(rsp.CreateRequest.CubeNetworkConfig))
 	}
 	w := tabwriter.NewWriter(os.Stdout, 4, 8, 4, ' ', 0)
-	fmt.Fprintln(w, "NODE_ID\tNODE_IP\tSTATUS\tPHASE\tSNAPSHOT_PATH\tSPEC\tERROR")
+	fmt.Fprintln(w, "NODE_ID\tNODE_IP\tSTATUS\tPHASE\tSPEC\tERROR")
 	for _, replica := range rsp.Replicas {
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-			replica.NodeID, replica.NodeIP, replica.Status, replica.Phase, replica.SnapshotPath, replica.Spec, replica.ErrorMessage)
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n",
+			replica.NodeID, replica.NodeIP, replica.Status, replica.Phase, replica.Spec, replica.ErrorMessage)
 	}
 	_ = w.Flush()
+}
+
+// fingerprintShortOrEmpty trims a sha256 hex fingerprint to the first
+// 16 chars for printing. Full 64-char string is usable for grep but
+// noisy in info output; the short form is enough for human eyeballing
+// and the field gets shipped raw in the JSON --json mode.
+func fingerprintShortOrEmpty(fp string) string {
+	if fp == "" {
+		return "(none)"
+	}
+	if len(fp) > 16 {
+		return fp[:16]
+	}
+	return fp
 }
 
 func printSandboxPreviewSummary(rsp *sandboxPreviewResponse) {
 	if rsp == nil {
 		return
 	}
-	fmt.Printf("request_id: %s\n", rsp.RequestID)
+	log.Printf("request_id: %s\n", rsp.RequestID)
 	if rsp.APIRequest != nil {
-		fmt.Printf("api_request: template=%s containers=%d volumes=%d network=%s\n",
+		log.Printf("api_request: template=%s containers=%d volumes=%d network=%s\n",
 			rsp.APIRequest.Annotations[constants.CubeAnnotationAppSnapshotTemplateID],
 			len(rsp.APIRequest.Containers), len(rsp.APIRequest.Volumes), rsp.APIRequest.NetworkType)
-		fmt.Printf("api_request_cubevs_context: %s\n", formatCubeVSContext(rsp.APIRequest.CubeVSContext))
+		log.Printf("api_request_cube_network_config: %s\n", formatCubeNetworkConfig(rsp.APIRequest.CubeNetworkConfig))
 	}
 	if rsp.MergedRequest != nil {
-		fmt.Printf("merged_request: containers=%d volumes=%d network=%s runtime=%s namespace=%s\n",
+		log.Printf("merged_request: containers=%d volumes=%d network=%s runtime=%s namespace=%s\n",
 			len(rsp.MergedRequest.Containers), len(rsp.MergedRequest.Volumes), rsp.MergedRequest.NetworkType,
 			rsp.MergedRequest.RuntimeHandler, rsp.MergedRequest.Namespace)
-		fmt.Printf("merged_request_cubevs_context: %s\n", formatCubeVSContext(rsp.MergedRequest.CubeVSContext))
+		log.Printf("merged_request_cube_network_config: %s\n", formatCubeNetworkConfig(rsp.MergedRequest.CubeNetworkConfig))
 	}
 	if rsp.CubeletRequest != nil {
-		fmt.Printf("cubelet_request: containers=%d volumes=%d exposed_ports=%d\n",
+		log.Printf("cubelet_request: containers=%d volumes=%d exposed_ports=%d\n",
 			len(rsp.CubeletRequest.Containers), len(rsp.CubeletRequest.Volumes), len(rsp.CubeletRequest.ExposedPorts))
-		fmt.Printf("cubelet_request_cubevs_context: %s\n", formatProtoCubeVSContext(rsp.CubeletRequest.CubevsContext))
+		log.Printf("cubelet_request_cube_network_config: %s\n", formatProtoCubeNetworkConfig(rsp.CubeletRequest.CubeNetworkConfig))
 	}
 }
 
@@ -1167,44 +1193,130 @@ func printTemplateImageJob(job *types.TemplateImageJobInfo) {
 		fmt.Println("job: <nil>")
 		return
 	}
-	fmt.Printf("job_id: %s\n", job.JobID)
-	fmt.Printf("template_id: %s\n", job.TemplateID)
+	log.Printf("job_id: %s\n", job.JobID)
+	log.Printf("template_id: %s\n", job.TemplateID)
 	if job.AttemptNo > 0 {
-		fmt.Printf("attempt_no: %d\n", job.AttemptNo)
+		log.Printf("attempt_no: %d\n", job.AttemptNo)
 	}
 	if job.RetryOfJobID != "" {
-		fmt.Printf("retry_of_job_id: %s\n", job.RetryOfJobID)
+		log.Printf("retry_of_job_id: %s\n", job.RetryOfJobID)
 	}
 	if job.Operation != "" {
-		fmt.Printf("operation: %s\n", job.Operation)
+		log.Printf("operation: %s\n", job.Operation)
 	}
 	if job.RedoMode != "" {
-		fmt.Printf("redo_mode: %s\n", job.RedoMode)
+		log.Printf("redo_mode: %s\n", job.RedoMode)
 	}
 	if len(job.RedoScope) > 0 {
-		fmt.Printf("redo_scope: %s\n", strings.Join(job.RedoScope, ","))
+		log.Printf("redo_scope: %s\n", strings.Join(job.RedoScope, ","))
 	}
 	if job.ResumePhase != "" {
-		fmt.Printf("resume_phase: %s\n", job.ResumePhase)
+		log.Printf("resume_phase: %s\n", job.ResumePhase)
 	}
-	fmt.Printf("artifact_id: %s\n", job.ArtifactID)
-	fmt.Printf("status: %s\n", job.Status)
-	fmt.Printf("phase: %s\n", job.Phase)
-	fmt.Printf("progress: %d%%\n", job.Progress)
-	fmt.Printf("distribution: %d/%d ready, %d failed\n", job.ReadyNodeCount, job.ExpectedNodeCount, job.FailedNodeCount)
+	log.Printf("artifact_id: %s\n", job.ArtifactID)
+	log.Printf("status: %s\n", job.Status)
+	log.Printf("phase: %s\n", job.Phase)
+	log.Printf("progress: %d%%\n", job.Progress)
+	log.Printf("distribution: %d/%d ready, %d failed\n", job.ReadyNodeCount, job.ExpectedNodeCount, job.FailedNodeCount)
 	if job.TemplateSpecFingerprint != "" {
-		fmt.Printf("template_spec_fingerprint: %s\n", job.TemplateSpecFingerprint)
+		log.Printf("template_spec_fingerprint: %s\n", job.TemplateSpecFingerprint)
 	}
 	if job.Artifact != nil {
-		fmt.Printf("artifact_status: %s\n", job.Artifact.Status)
-		fmt.Printf("artifact_sha256: %s\n", job.Artifact.Ext4SHA256)
+		log.Printf("artifact_status: %s\n", job.Artifact.Status)
+		log.Printf("artifact_sha256: %s\n", job.Artifact.Ext4SHA256)
 	}
 	if job.TemplateStatus != "" {
-		fmt.Printf("template_status: %s\n", job.TemplateStatus)
+		log.Printf("template_status: %s\n", job.TemplateStatus)
 	}
 	if job.ErrorMessage != "" {
-		fmt.Printf("error: %s\n", job.ErrorMessage)
+		log.Printf("error: %s\n", job.ErrorMessage)
 	}
+}
+
+func formatTemplateImageJobWatchPhase(job *types.TemplateImageJobInfo) string {
+	phase := "UNKNOWN"
+	if job != nil {
+		if job.Status == "READY" {
+			return "[7/7] READY"
+		}
+		if job.Phase != "" {
+			phase = job.Phase
+		}
+	}
+
+	phaseOrder := map[string]int{
+		"PULLING":           1,
+		"UNPACKING":         2,
+		"BUILDING_EXT4":     3,
+		"GENERATING_JSON":   4,
+		"DISTRIBUTING":      5,
+		"CREATING_TEMPLATE": 6,
+	}
+	if step, ok := phaseOrder[phase]; ok {
+		return fmt.Sprintf("[%d/7] %s", step, phase)
+	}
+	return fmt.Sprintf("[?/7] %s", phase)
+}
+
+func formatTemplateImageJobWatchLine(job *types.TemplateImageJobInfo) string {
+	if job == nil {
+		return "[?/7] UNKNOWN"
+	}
+	parts := []string{formatTemplateImageJobWatchPhase(job)}
+	parts = append(parts, fmt.Sprintf("progress=%d%%", job.Progress))
+	if job.ExpectedNodeCount > 0 || job.ReadyNodeCount > 0 || job.FailedNodeCount > 0 {
+		parts = append(parts, fmt.Sprintf("distribution=%d/%d ready, %d failed", job.ReadyNodeCount, job.ExpectedNodeCount, job.FailedNodeCount))
+	}
+	if job.TemplateID != "" {
+		parts = append(parts, fmt.Sprintf("template_id=%s", job.TemplateID))
+	}
+	if job.JobID != "" {
+		parts = append(parts, fmt.Sprintf("job_id=%s", job.JobID))
+	}
+	if job.ArtifactID != "" {
+		parts = append(parts, fmt.Sprintf("artifact_id=%s", job.ArtifactID))
+	}
+	if job.ErrorMessage != "" {
+		parts = append(parts, fmt.Sprintf("error=%s", job.ErrorMessage))
+	}
+	return strings.Join(parts, " ")
+}
+
+func formatTemplateImageJobCompletionSummary(job *types.TemplateImageJobInfo) string {
+	if job == nil {
+		return "template image job finished with empty response"
+	}
+	status := "finished"
+	if job.Status == "READY" {
+		status = "succeeded"
+	} else if job.Status == "FAILED" {
+		status = "failed"
+	}
+	parts := []string{fmt.Sprintf("template image job %s", status)}
+	if job.TemplateID != "" {
+		parts = append(parts, fmt.Sprintf("template_id=%s", job.TemplateID))
+	}
+	if job.JobID != "" {
+		parts = append(parts, fmt.Sprintf("job_id=%s", job.JobID))
+	}
+	if job.ArtifactID != "" {
+		parts = append(parts, fmt.Sprintf("artifact_id=%s", job.ArtifactID))
+	}
+	if job.ExpectedNodeCount > 0 || job.ReadyNodeCount > 0 || job.FailedNodeCount > 0 {
+		parts = append(parts, fmt.Sprintf("distribution=%d/%d ready, %d failed", job.ReadyNodeCount, job.ExpectedNodeCount, job.FailedNodeCount))
+	}
+	if job.ErrorMessage != "" {
+		parts = append(parts, fmt.Sprintf("error=%s", job.ErrorMessage))
+	}
+	return strings.Join(parts, " ")
+}
+
+func printTemplateImageJobWatchLine(job *types.TemplateImageJobInfo) {
+	log.Print(formatTemplateImageJobWatchLine(job) + "\n")
+}
+
+func printTemplateImageJobCompletionSummary(job *types.TemplateImageJobInfo) {
+	log.Print(formatTemplateImageJobCompletionSummary(job) + "\n")
 }
 
 func fetchTemplateBuildStatus(c *cli.Context, buildID string) (*templateBuildStatusResponse, error) {
@@ -1234,18 +1346,18 @@ func printTemplateBuildStatus(rsp *templateBuildStatusResponse) {
 		fmt.Println("build: <nil>")
 		return
 	}
-	fmt.Printf("build_id: %s\n", rsp.BuildID)
-	fmt.Printf("template_id: %s\n", rsp.TemplateID)
+	log.Printf("build_id: %s\n", rsp.BuildID)
+	log.Printf("template_id: %s\n", rsp.TemplateID)
 	if rsp.AttemptNo > 0 {
-		fmt.Printf("attempt_no: %d\n", rsp.AttemptNo)
+		log.Printf("attempt_no: %d\n", rsp.AttemptNo)
 	}
 	if rsp.RetryOfJobID != "" {
-		fmt.Printf("retry_of_job_id: %s\n", rsp.RetryOfJobID)
+		log.Printf("retry_of_job_id: %s\n", rsp.RetryOfJobID)
 	}
-	fmt.Printf("status: %s\n", rsp.Status)
-	fmt.Printf("progress: %d%%\n", rsp.Progress)
+	log.Printf("status: %s\n", rsp.Status)
+	log.Printf("progress: %d%%\n", rsp.Progress)
 	if rsp.Message != "" {
-		fmt.Printf("message: %s\n", rsp.Message)
+		log.Printf("message: %s\n", rsp.Message)
 	}
 }
 
@@ -1268,11 +1380,12 @@ func parseContainerOverrides(c *cli.Context) (*types.ContainerOverrides, error) 
 	cmds := c.StringSlice("cmd")
 	args := c.StringSlice("arg")
 	rawEnvs := c.StringSlice("env")
+	dnsServers := c.StringSlice("dns")
 	probePort := c.Int("probe")
 	cpuMillicores := c.Int("cpu")
 	memoryMB := c.Int("memory")
 
-	if len(cmds) == 0 && len(args) == 0 && len(rawEnvs) == 0 && probePort == 0 && !c.IsSet("cpu") && !c.IsSet("memory") {
+	if len(cmds) == 0 && len(args) == 0 && len(rawEnvs) == 0 && len(dnsServers) == 0 && probePort == 0 && !c.IsSet("cpu") && !c.IsSet("memory") {
 		return nil, nil
 	}
 
@@ -1292,6 +1405,14 @@ func parseContainerOverrides(c *cli.Context) (*types.ContainerOverrides, error) 
 			Key:   kv[:idx],
 			Value: kv[idx+1:],
 		})
+	}
+	if len(dnsServers) > 0 {
+		for _, dnsServer := range dnsServers {
+			if dnsServer == "" || net.ParseIP(dnsServer) == nil {
+				return nil, fmt.Errorf("invalid dns server %q", dnsServer)
+			}
+		}
+		overrides.DnsConfig = &types.DNSConfig{Servers: dnsServers}
 	}
 	if c.IsSet("cpu") || c.IsSet("memory") {
 		overrides.Resources = &types.Resource{

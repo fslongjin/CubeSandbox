@@ -3,16 +3,16 @@
 本指南介绍如何将单机 Cube Sandbox 部署扩展为多机集群，通过添加**计算节点**来实现。计算节点只运行沙箱运行时组件（`Cubelet`、`network-agent`、`CubeShim`），并向第一台机器上的控制面注册。
 
 ::: tip 前置条件
-添加计算节点前，你必须先通过[本地构建部署指南](./self-build-deploy)完成控制节点的部署。
+添加计算节点前，你必须先通过[本地构建部署指南](./self-build-deploy.md)完成控制节点的部署。
 :::
 
 ## 架构概览
 
 ```
 ┌─────────────────────────────────────────┐
-│              控制节点                     │
-│  CubeMaster, cube-api, CubeProxy,      │
-│  CoreDNS, MySQL, Redis,                │
+│              控制节点                    │
+│  CubeMaster, cube-api, CubeProxy,       │
+│  CoreDNS, MySQL, Redis,                 │
 │  Cubelet, network-agent                 │
 └──────────────────┬──────────────────────┘
                    │  /internal/meta API
@@ -37,7 +37,7 @@
 - **Docker** 已安装并运行
 - 到控制节点的**网络连通性**（默认需访问 `CubeMaster` 的 `8089` 端口）
 
-完整要求列表请参阅[本地构建部署 — 前置条件](./self-build-deploy#前置条件)。
+完整要求列表请参阅[本地构建部署 — 前置条件](./self-build-deploy.md#前置条件)。
 
 ## 第一步：准备发布包
 
@@ -137,7 +137,7 @@ sudo ./down.sh
 | 运行时 PID 文件 | `/var/run/cube-sandbox-one-click/` |
 | 进程标准输出/错误 | `/var/log/cube-sandbox-one-click/` |
 
-控制节点的日志路径请参阅[本地构建部署 — 查看日志](./self-build-deploy#查看日志)。
+控制节点的日志路径请参阅[本地构建部署 — 查看日志](./self-build-deploy.md#查看日志)。
 
 ## 配置参考
 
@@ -149,10 +149,12 @@ sudo ./down.sh
 | `ONE_CLICK_CONTROL_PLANE_IP` | 空 | 控制节点 IP，默认拼接为 `<ip>:8089` |
 | `ONE_CLICK_CONTROL_PLANE_CUBEMASTER_ADDR` | 空 | 显式指定 CubeMaster 地址，优先级高于 `ONE_CLICK_CONTROL_PLANE_IP` |
 | `CUBE_SANDBOX_NODE_IP` | `10.0.0.10` | **必须修改。** 当前节点主网卡 IP |
+| `CUBE_SANDBOX_NETWORK_CIDR` | `192.168.0.0/18`（取自 `config.toml`） | cubevs 本地网络 CIDR。需与控制节点一致。格式为 IPv4 CIDR（如 `10.100.0.0/18`），掩码范围 /8~/30。安装时自动检测宿主机冲突。 |
+| `CUBE_SANDBOX_NETWORK_CIDR_SKIP_CONFLICT_CHECK` | `0` | 设为 `1` 跳过冲突检测（不推荐）。 |
 | `ONE_CLICK_INSTALL_PREFIX` | `/usr/local/services/cubetoolbox` | 安装目录 |
 | `ONE_CLICK_RUN_QUICKCHECK` | `1` | 安装后是否执行健康检查 |
 
-完整配置参考（构建选项、数据库、代理等）请参阅[本地构建部署 — 配置参考](./self-build-deploy#配置参考)。
+完整配置参考（构建选项、数据库、代理等）请参阅[本地构建部署 — 配置参考](./self-build-deploy.md#配置参考）。
 
 ## 故障排查
 
@@ -176,4 +178,4 @@ curl http://<控制节点IP>:8089/internal/meta/nodes
 2. 确认 Cubelet 配置中的 `meta_server_endpoint` 指向正确的 CubeMaster 地址
 3. 确保 `CUBE_SANDBOX_NODE_IP` 设为可路由的 IP（不是 `127.0.0.1`）
 
-通用故障排查（Docker、KVM、DNS 等）请参阅[本地构建部署 — 故障排查](./self-build-deploy#故障排查)。
+通用故障排查（Docker、KVM、DNS 等）请参阅[本地构建部署 — 故障排查](./self-build-deploy.md#故障排查)。

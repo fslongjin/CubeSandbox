@@ -1641,19 +1641,6 @@ impl FsConfig {
     }
 
     pub fn validate(&self, vm_config: &VmConfig) -> ValidationResult<()> {
-        if self.backendfs_config.is_some() {
-            if self.socket.to_str() != Some("") {
-                return Err(ValidationError::NativeVirtioFsSocket);
-            }
-        } else {
-            if self.socket.to_str() == Some("") {
-                return Err(ValidationError::VhostUserMissingSocket);
-            }
-            if !vm_config.backed_by_shared_memory() {
-                return Err(ValidationError::VhostUserRequiresSharedMemory);
-            }
-        }
-
         if self.num_queues > vm_config.cpus.boot_vcpus as usize {
             return Err(ValidationError::TooManyQueues);
         }
@@ -1669,6 +1656,19 @@ impl FsConfig {
                         self.pci_segment,
                     ));
                 }
+            }
+        }
+
+        if self.backendfs_config.is_some() {
+            if self.socket.to_str() != Some("") {
+                return Err(ValidationError::NativeVirtioFsSocket);
+            }
+        } else {
+            if !vm_config.backed_by_shared_memory() {
+                return Err(ValidationError::VhostUserRequiresSharedMemory);
+            }
+            if self.socket.to_str() == Some("") {
+                return Err(ValidationError::VhostUserMissingSocket);
             }
         }
 
@@ -2104,16 +2104,28 @@ pub struct RestoreConfig {
     pub pmem: Option<Vec<PmemConfig>>,
     #[serde(default)]
     pub dirty_log: bool,
+    /// Optional existing memory blob path for reading memory range data from a
+    /// separate volume.
+    /// Accepts either an absolute path like `/dev/vdb` or a `file:///dev/vdb`
+    /// URL. When set, memory snapshots are read from this path instead of
+    /// source_url/<SNAPSHOT_FILENAME>.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_vol_url: Option<String>,
 }
 
 impl RestoreConfig {
     pub const SYNTAX: &'static str = "Restore from a VM snapshot. \
-        \nRestore parameters \"source_url=<source_url>,prefault=on|off\" \
+        \nRestore parameters \"source_url=<source_url>,prefault=on|off,memory_vol_url=<memory_vol_url>\" \
         \n`source_url` should be a valid URL (e.g file:///foo/bar or tcp://192.168.1.10/foo) \
-        \n`prefault` brings memory pages in when enabled (disabled by default)";
+        \n`prefault` brings memory pages in when enabled (disabled by default) \
+        \n`memory_vol_url` optional existing memory blob path (for example /dev/vdb or file:///dev/vdb) \
+        \nfor reading memory range data from a separate volume";
     pub fn parse(restore: &str) -> Result<Self> {
         let mut parser = OptionParser::new();
-        parser.add("source_url").add("prefault");
+        parser
+            .add("source_url")
+            .add("prefault")
+            .add("memory_vol_url");
         parser.parse(restore).map_err(Error::ParseRestore)?;
 
         let source_url = parser
@@ -2131,6 +2143,8 @@ impl RestoreConfig {
             .unwrap_or(Toggle(false))
             .0;
 
+        let memory_vol_url = parser.get("memory_vol_url");
+
         Ok(RestoreConfig {
             source_url,
             prefault,
@@ -2140,6 +2154,7 @@ impl RestoreConfig {
             vsock: None,
             pmem: None,
             dirty_log,
+            memory_vol_url,
         })
     }
 }

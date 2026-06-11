@@ -1,10 +1,10 @@
 # syntax=docker/dockerfile:1.7
 
-FROM ubuntu:22.04
+FROM ubuntu:20.04
 
 ARG DEBIAN_FRONTEND=noninteractive
-ARG APT_PRIMARY_MIRROR=http://mirrors.tuna.tsinghua.edu.cn/ubuntu
-ARG APT_SECURITY_MIRROR=http://mirrors.tuna.tsinghua.edu.cn/ubuntu
+ARG APT_PRIMARY_MIRROR=http://mirrors.tencent.com/ubuntu
+ARG APT_SECURITY_MIRROR=http://mirrors.tencent.com/ubuntu
 ARG GO_VERSION=1.24.8
 ARG PROTOC_VERSION=28.3
 ARG LIBSECCOMP_VERSION=2.5.5
@@ -12,6 +12,9 @@ ARG RUST_TOOLCHAIN_DEFAULT=1.89
 ARG RUST_TOOLCHAIN_HYPERVISOR=1.77.2
 ARG RUST_TOOLCHAIN_E2BAPI=1.85
 ARG RUST_TOOLCHAIN_AGENT=1.89
+ARG GITHUB_ACTIONS=false
+ARG RUSTUP_DIST_SERVER=https://rsproxy.cn
+ARG RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup
 
 ENV LANG=C.UTF-8 \
     LC_ALL=C.UTF-8 \
@@ -28,9 +31,16 @@ ENV LANG=C.UTF-8 \
     LIBSECCOMP_LINK_TYPE=static \
     LIBSECCOMP_LIB_PATH=/usr/local/lib64/libseccomp/lib
 
-# RUN sed -i "s|http://archive.ubuntu.com/ubuntu|${APT_PRIMARY_MIRROR}|g; s|http://security.ubuntu.com/ubuntu|${APT_SECURITY_MIRROR}|g" /etc/apt/sources.list \
-    RUN apt-get update -o Acquire::Retries=3 \
-    && apt install -y ca-certificates \
+RUN apt-get update -o Acquire::Retries=3 \
+    && apt install -y ca-certificates --no-install-recommends
+    
+RUN if [ "${GITHUB_ACTIONS}" != "true" ]; then \
+        sed -i "s|http://archive.ubuntu.com/ubuntu|${APT_PRIMARY_MIRROR}|g; \
+                s|http://security.ubuntu.com/ubuntu|${APT_SECURITY_MIRROR}|g" \
+            /etc/apt/sources.list; \
+    fi
+
+RUN apt-get update -o Acquire::Retries=3 \
     && apt-get install -y --no-install-recommends \
         bash \
         bc \
@@ -53,7 +63,9 @@ ENV LANG=C.UTF-8 \
         jq \
         libcap-dev \
         libcap-ng-dev \
+        libdevmapper-dev \
         libelf-dev \
+        libbpf-dev \
         libglib2.0-dev \
         libiberty-dev \
         libpixman-1-dev \
@@ -104,8 +116,8 @@ RUN go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11 \
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     | sh -s -- -y --profile minimal --default-toolchain none
 
-ENV RUSTUP_DIST_SERVER="https://rsproxy.cn"
-ENV RUSTUP_UPDATE_ROOT="https://rsproxy.cn/rustup"
+ENV RUSTUP_DIST_SERVER="${RUSTUP_DIST_SERVER}"
+ENV RUSTUP_UPDATE_ROOT="${RUSTUP_UPDATE_ROOT}"
 
 RUN set -eux; \
     for toolchain in "${RUST_TOOLCHAIN_HYPERVISOR}" "${RUST_TOOLCHAIN_E2BAPI}" "${RUST_TOOLCHAIN_AGENT}"; do \

@@ -10,7 +10,6 @@ import (
 	"expvar"
 	"fmt"
 	stdlog "log"
-	"math/rand"
 	"net"
 	"net/http"
 	"net/http/pprof"
@@ -20,6 +19,8 @@ import (
 	"time"
 
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/config"
+	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/dao"
+	_ "github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/dao/driver/mysql" // register mysql driver
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/log"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/recov"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/cubelet/grpcconn"
@@ -50,8 +51,6 @@ func (a *App) Run() {
 		ctx, cancel = context.WithCancel(context.Background())
 	)
 	defer cancel()
-
-	rand.Seed(time.Now().UnixNano())
 
 	cfg := config.GetConfig()
 
@@ -134,6 +133,15 @@ func coreInit(ctx context.Context, cfg *config.Config) error {
 		return nil
 	}
 
+	// Run schema migrations BEFORE any business package Init so they all
+	// see the HEAD schema. Migration uses the same connection pool the
+	// dao facade hands back via dao.Default(); business packages that
+	// still use db.Init() get their own pool but talk to the same MySQL
+	// instance, so they observe the post-migration schema.
+	if err := initDatabaseSchema(ctx, cfg); err != nil {
+		return fmt.Errorf("dao migrate: %w", err)
+	}
+
 	if err := nodemeta.Init(ctx); err != nil {
 		stdlog.Fatalf("nodemeta init fail:%v", err)
 		return err
@@ -161,6 +169,62 @@ func coreInit(ctx context.Context, cfg *config.Config) error {
 		return err
 	}
 
+	return nil
+}
+
+// initDatabaseSchema opens the canonical dao handle and runs every
+// pending migration. The cluster-wide GET_LOCK held by the driver's
+// SessionLocker serialises this across CubeMaster instances starting up
+// in parallel, so it is safe to invoke unconditionally from every
+// process; whoever loses the lock race blocks until the winner is done,
+// then sees the schema is already at HEAD and returns immediately.
+func initDatabaseSchema(ctx context.Context, cfg *config.Config) error {
+	// The schema produced by pkg/base/dao/migrate/migrations is a single
+	// catalog covering both the OSS-side tables (t_cube_host_*, t_cube_node_*,
+	// ...) and the instance-side tables (t_cube_template_*, t_cube_instance_*,
+	// t_cube_sandbox_spec, ...). Running migrations against only one of the
+	// two configured databases would silently leave the other half empty, so
+	// any deployment that genuinely points the two configs at different
+	// physical databases is unsupported and must fail fast at startup.
+	if inst, oss := cfg.InstanceDBConfig, cfg.OssDBConfig; inst != nil && oss != nil {
+		if inst.Driver != oss.Driver || inst.Addr != oss.Addr || inst.DBName != oss.DBName {
+			return fmt.Errorf(
+				"dao: instance_db_config and ossdb_config must point to the same physical database "+
+					"(instance=%s/%s/%s, oss=%s/%s/%s); split-database deployments are not supported by the current schema",
+				inst.Driver, inst.Addr, inst.DBName,
+				oss.Driver, oss.Addr, oss.DBName,
+			)
+		}
+	}
+	src := cfg.InstanceDBConfig
+	if src == nil {
+		src = cfg.OssDBConfig
+	}
+	if src == nil {
+		return fmt.Errorf("dao: neither instance_db_config nor ossdb_config is set")
+	}
+	daoCfg := dao.Config{
+		Driver:                      src.Driver,
+		Addr:                        src.Addr,
+		User:                        src.User,
+		Pwd:                         src.Pwd,
+		DBName:                      src.DBName,
+		ConnTimeoutSeconds:          src.ConnTimeout,
+		ReadTimeoutSeconds:          src.ReadTimeout,
+		WriteTimeoutSeconds:         src.WriteTimeout,
+		MaxIdleConns:                src.MaxIdleConns,
+		MaxOpenConns:                src.MaxOpenConns,
+		MaxConnLifeTimeSeconds:      src.MaxConnLifeTimeSeconds,
+		MigrationLockTimeoutSeconds: src.MigrationLockTimeoutSeconds,
+	}
+	if _, err := dao.Open(ctx, daoCfg); err != nil {
+		return fmt.Errorf("dao open: %w", err)
+	}
+	if err := dao.Migrate(ctx); err != nil {
+		return fmt.Errorf("dao migrate: %w", err)
+	}
+	CubeLog.WithContext(ctx).Infof("dao schema migration completed (driver=%s db=%s)",
+		daoCfg.Driver, daoCfg.DBName)
 	return nil
 }
 

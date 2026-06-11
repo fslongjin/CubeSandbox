@@ -41,6 +41,7 @@ type Config struct {
 	Scheduler         *WrapperSchedulerConf `yaml:"scheduler"`
 	ReqTemplateConf   *ReqTemplateConf      `yaml:"req_template_conf"`
 	HookWhitelist     *HookWhitelist        `yaml:"hook_whitelist"`
+	CubeEgressConf    *CubeEgressConf       `yaml:"cube_egress_conf"`
 }
 
 type CommonConf struct {
@@ -103,6 +104,11 @@ type Debug struct {
 }
 
 type DBConfig struct {
+	// Driver selects the dao engine ("mysql", future: "postgres", ...).
+	// Empty defaults to "mysql" for backwards compatibility with v0.2.2
+	// configurations that pre-date the multi-driver dao layer.
+	Driver string `yaml:"driver"`
+
 	Addr                   string `yaml:"addr"`
 	User                   string `yaml:"user"`
 	Pwd                    string `yaml:"pwd"`
@@ -113,6 +119,10 @@ type DBConfig struct {
 	MaxIdleConns           int    `yaml:"max_idle_conns"`
 	MaxOpenConns           int    `yaml:"max_open_conns"`
 	MaxConnLifeTimeSeconds int    `yaml:"max_conn_life_time_seconds"`
+
+	// MigrationLockTimeoutSeconds bounds the cluster-wide GET_LOCK wait
+	// at startup. Defaults to 60 seconds when zero.
+	MigrationLockTimeoutSeconds int `yaml:"migration_lock_timeout_seconds"`
 }
 
 type ExtraConf struct {
@@ -393,6 +403,35 @@ type ReqTemplateConf struct {
 	CubeBoxReqTemplate string         `yaml:"cube_box_req_template"`
 	WhitelistReqTag    map[string]any `yaml:"whitelist_req_tag"`
 }
+
+// CubeEgressConf controls how CubeMaster bakes the CubeEgress root CA
+// into freshly-built sandbox rootfs templates so workloads inside the
+// sandbox trust the MITM certificates CubeEgress signs at request
+// time. See design/cube-egress-ca-bake.md.
+type CubeEgressConf struct {
+	// CAPath is the host-side filesystem location of the CubeEgress
+	// root certificate (PEM). Empty disables the bake silently —
+	// preserves dev/test setups where CubeEgress isn't deployed. The
+	// production deployment path drops the CA here as part of
+	// up-cube-egress.sh; CubeMaster reads from the same file so the
+	// data plane and the bake stay in lock-step on rotation.
+	CAPath string `yaml:"ca_path"`
+
+	// Required, when true, turns soft skips into hard errors:
+	//   - missing CAPath file → fail the template build
+	//   - zero bundle/anchor targets matched → fail the template build
+	// Production deployments should set this to true so a misdeploy
+	// where the CA file is absent fails loudly instead of producing a
+	// silently-broken template.
+	Required bool `yaml:"required"`
+}
+
+// DefaultCubeEgressCAPath is the canonical install path. Used when
+// CubeEgressConf is unset or its CAPath is empty AND Required is true
+// (meaning: an operator opted into the strict mode but forgot to
+// configure the path; we'd rather try the canonical path than refuse
+// to start).
+const DefaultCubeEgressCAPath = "/etc/cube/ca/cube-root-ca.crt"
 
 type AppHookConfig struct {
 	PrestartHookByEnvKeys map[string][]*types.Hook `yaml:"prestart_hook_by_env_keys"`

@@ -3,7 +3,9 @@
 //
 
 use crate::cubemaster::CubeMasterClient;
+use crate::db::AgentHubStore;
 use crate::logging::ArcLogger;
+use crate::services::AppServices;
 use governor::{DefaultKeyedRateLimiter, Quota, RateLimiter};
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -19,14 +21,17 @@ pub struct AppState {
     /// Shared reqwest connection pool.
     pub http_client: reqwest::Client,
 
-    /// CubeMaster thin client.
-    pub cubemaster: CubeMasterClient,
+    /// Shared business services built on top of CubeMaster.
+    pub services: AppServices,
 
     /// Structured event logger (fan-out to all configured backends).
     pub logger: ArcLogger,
 
     /// Server config snapshot.
     pub config: Arc<crate::config::ServerConfig>,
+
+    /// Optional database-backed AgentHub instance store.
+    pub agenthub_store: Option<AgentHubStore>,
 }
 
 impl AppState {
@@ -34,7 +39,7 @@ impl AppState {
     ///
     /// The `logger` is built externally (in `main.rs`) because `FileLogger::new`
     /// is async and requires the Tokio runtime to be running.
-    pub fn new(config: crate::config::ServerConfig, logger: ArcLogger) -> Self {
+    pub async fn new(config: crate::config::ServerConfig, logger: ArcLogger) -> Self {
         let quota = Quota::per_second(NonZeroU32::new(config.rate_limit_per_sec.max(1)).unwrap());
         let rate_limiter = Arc::new(RateLimiter::keyed(quota));
 
@@ -45,13 +50,29 @@ impl AppState {
             .expect("failed to build HTTP client");
 
         let cubemaster = CubeMasterClient::new(config.cubemaster_url.clone(), http_client.clone());
+        let services = AppServices::new(&config, cubemaster.clone());
+        let agenthub_store = match config
+            .database_url
+            .as_deref()
+            .filter(|v| !v.trim().is_empty())
+        {
+            Some(url) => match AgentHubStore::connect(url).await {
+                Ok(store) => Some(store),
+                Err(err) => {
+                    tracing::warn!(error = %err, "agenthub database disabled");
+                    None
+                }
+            },
+            None => None,
+        };
 
         Self {
             rate_limiter,
             http_client,
-            cubemaster,
+            services,
             logger,
             config: Arc::new(config),
+            agenthub_store,
         }
     }
 }

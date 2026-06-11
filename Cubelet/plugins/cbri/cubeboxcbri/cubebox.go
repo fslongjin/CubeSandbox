@@ -32,7 +32,8 @@ import (
 	cubeboxstore "github.com/tencentcloud/CubeSandbox/Cubelet/pkg/store/cubebox"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/utils"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/plugins/workflow"
-	"github.com/tencentcloud/CubeSandbox/cubelog"
+	"github.com/tencentcloud/CubeSandbox/Cubelet/storage"
+	CubeLog "github.com/tencentcloud/CubeSandbox/cubelog"
 	"k8s.io/apimachinery/pkg/api/resource"
 )
 
@@ -146,12 +147,17 @@ func (e *cubeboxInstancePlugin) CreateSandbox(ctx context.Context, flowOpts *wor
 		kernelPath  string
 	)
 
-	if constants.GetAppImageID(ctx) == "" {
+	appImageID := constants.GetAppImageID(ctx)
+	if appImageID == "" {
 		kernelPath = filepath.Join(e.config.BasePath, "cube-kernel-scf", "vmlinux")
 	} else {
-
-		kernelPath = e.getKernelFilePath(constants.GetAppImageID(ctx))
-		rootfs := filepath.Join(e.config.ImageBasePath, constants.GetAppImageID(ctx))
+		if flowOpts.IsCreateSnapshot() {
+			if err := e.syncLatestKernelForImage(ctx, appImageID); err != nil {
+				return nil, err
+			}
+		}
+		kernelPath = e.getKernelFilePath(appImageID)
+		rootfs := filepath.Join(e.config.ImageBasePath, appImageID)
 		specOpts = append(specOpts, oci.WithRootFSPath(rootfs))
 		logEntry = logEntry.WithField("rootfs", rootfs)
 	}
@@ -169,8 +175,7 @@ func (e *cubeboxInstancePlugin) CreateSandbox(ctx context.Context, flowOpts *wor
 
 	} else if templateID, ok := flowOpts.GetSnapshotTemplateID(); ok {
 
-		var snapBasePath string
-		var snapSpecPath string
+		var snapBasePath, snapSpecPath string
 
 		if flowOpts.IsCubeboxV2() {
 			if flowOpts.LocalRunTemplate == nil {
@@ -200,10 +205,26 @@ func (e *cubeboxInstancePlugin) CreateSandbox(ctx context.Context, flowOpts *wor
 		}
 
 		annotations[constants.AnnotationVMSnapshotPath] = snapBasePath
+		memoryVolURL := snapshotRestoreMemoryVolURLFromStorageInfo(flowOpts)
+		if memoryVolURL != "" {
+			annotations[constants.AnnotationVMSnapshotMemoryVolURL] = memoryVolURL
+			logEntry.WithField("memory_vol_url", memoryVolURL).Warnf("resolved snapshot restore memory volume")
+		} else {
+			// v4: physical refs live in cubelet's snapshot catalog keyed by
+			// logical id (runtime snapshot id / appsnapshot template id).
+			// If neither annotation is present, the request is not a snapshot
+			// restore at all; otherwise the catalog entry for the logical id
+			// is missing/empty and Cubelet has already returned a fail-fast
+			// error upstream of this point.
+			logEntry.WithFields(CubeLog.Fields{
+				"runtime_snapshot_id": realReq.GetAnnotations()[constants.MasterAnnotationRuntimeSnapshotID],
+				"appsnapshot_tpl_id":  realReq.GetAnnotations()[constants.MasterAnnotationAppSnapshotTemplateID],
+			}).Warnf("missing snapshot restore memory volume")
+		}
 
 		annotations[constants.AnnotationAppSnapshotRestore] = "true"
 
-		annotations[constants.AnnotationAppSnapshotContainerID] = templateID + "_" + "0"
+		annotations[constants.AnnotationAppSnapshotContainerID] = snapshotRestoreContainerID(templateID, snapSpecPath)
 
 		sandbox := cubeboxstore.GetCubeBox(ctx)
 		if sandbox != nil && sandbox.FirstContainer() != nil {
@@ -377,6 +398,15 @@ func (e *cubeboxInstancePlugin) genPmemOpt(ctx context.Context, imageID string) 
 func (e *cubeboxInstancePlugin) getImageFilePath(imageID string) string {
 	return filepath.Join(e.config.ImageBasePath, imageID, imageID+".ext4")
 }
+
+func (e *cubeboxInstancePlugin) syncLatestKernelForImage(ctx context.Context, imageID string) error {
+	return pmem.RefreshKernelFile(
+		ctx,
+		filepath.Join(e.config.BasePath, "cube-kernel-scf", "vmlinux"),
+		e.getKernelFilePath(imageID),
+	)
+}
+
 func (e *cubeboxInstancePlugin) getKernelFilePath(imageID string) string {
 	return filepath.Join(e.config.KernelBasePath, imageID, imageID+".vm")
 }
@@ -444,7 +474,7 @@ func (e *cubeboxInstancePlugin) resolveSnapshotPaths(templateID, rawPath string,
 		return nil, err
 	}
 
-	path := strings.TrimSpace(rawPath)
+	path := normalizeSnapshotRestorePath(strings.TrimSpace(rawPath))
 	if path == "" {
 		base := e.getSnapShotFilePath(templateID)
 		return &snapshotPaths{
@@ -453,7 +483,7 @@ func (e *cubeboxInstancePlugin) resolveSnapshotPaths(templateID, rawPath string,
 		}, nil
 	}
 
-	if looksLikeSnapshotSpecPath(path) {
+	if looksLikeSnapshotSpecPath(path) || looksLikeSnapshotSpecDir(path) {
 		return &snapshotPaths{
 			Base: filepath.Dir(path),
 			Spec: path,
@@ -466,16 +496,31 @@ func (e *cubeboxInstancePlugin) resolveSnapshotPaths(templateID, rawPath string,
 	}, nil
 }
 
+func normalizeSnapshotRestorePath(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return ""
+	}
+	clean := filepath.Clean(path)
+	base := filepath.Base(clean)
+	if !strings.HasSuffix(base, ".tmp") {
+		return clean
+	}
+	return filepath.Join(filepath.Dir(clean), strings.TrimSuffix(base, ".tmp"))
+}
+
 func inferSnapshotResDirFromRequest(req *cubebox.RunCubeSandboxRequest) (string, error) {
 	if req == nil || len(req.Containers) == 0 || req.Containers[0].GetResources() == nil {
 		return "", fmt.Errorf("local snapshot not exist")
 	}
 
-	cpuQ, err := resource.ParseQuantity(req.Containers[0].GetResources().GetCpu())
+	resources := req.Containers[0].GetResources()
+
+	cpuQ, err := resource.ParseQuantity(resources.GetCpu())
 	if err != nil {
 		return "", fmt.Errorf("parse snapshot cpu resource failed: %w", err)
 	}
-	memQ, err := resource.ParseQuantity(req.Containers[0].GetResources().GetMem())
+	memQ, err := resource.ParseQuantity(resources.GetMem())
 	if err != nil {
 		return "", fmt.Errorf("parse snapshot memory resource failed: %w", err)
 	}
@@ -489,13 +534,52 @@ func inferSnapshotResDirFromRequest(req *cubebox.RunCubeSandboxRequest) (string,
 	return fmt.Sprintf("%dC%dM", cpu, mem), nil
 }
 
+func snapshotRestoreMemoryVolURLFromStorageInfo(flowOpts *workflow.CreateContext) string {
+	if flowOpts == nil || flowOpts.StorageInfo == nil {
+		return ""
+	}
+	info, ok := flowOpts.StorageInfo.(*storage.StorageInfo)
+	if !ok || info == nil {
+		return ""
+	}
+	return strings.TrimSpace(info.RestoreMemoryVolURL)
+}
+
+type snapshotMetadata struct {
+	AppSnapshotContainerID string `json:"app_snapshot_container_id,omitempty"`
+}
+
+func snapshotRestoreContainerID(templateID, snapshotSpecPath string) string {
+	fallback := strings.TrimSpace(templateID) + "_0"
+	metadataPath := filepath.Join(filepath.Clean(snapshotSpecPath), "metadata.json")
+	data, err := os.ReadFile(metadataPath)
+	if err != nil {
+		return fallback
+	}
+	var metadata snapshotMetadata
+	if err := json.Unmarshal(data, &metadata); err != nil {
+		return fallback
+	}
+	if value := strings.TrimSpace(metadata.AppSnapshotContainerID); value != "" {
+		return value
+	}
+	return fallback
+}
+
 func looksLikeSnapshotSpecPath(path string) bool {
-	base := filepath.Base(filepath.Clean(path))
-	if !strings.HasSuffix(base, "M") || !strings.Contains(base, "C") {
+	if !looksLikeSnapshotSpecDir(path) {
 		return false
 	}
 	_, err := os.Stat(filepath.Join(path, "metadata.json"))
 	return err == nil
+}
+
+func looksLikeSnapshotSpecDir(path string) bool {
+	base := filepath.Base(filepath.Clean(path))
+	if !strings.HasSuffix(base, "M") || !strings.Contains(base, "C") {
+		return false
+	}
+	return true
 }
 
 var _ cbri.API = &cubeboxInstancePlugin{}

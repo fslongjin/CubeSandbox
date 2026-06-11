@@ -16,6 +16,7 @@ import (
 
 var (
 	restoreTapFunc         = restoreTap
+	openTapFdByNameFunc    = openTapFdByName
 	newTapFunc             = newTap
 	cubevsListTAPDevices   = cubevs.ListTAPDevices
 	cubevsListPortMappings = cubevs.ListPortMapping
@@ -140,7 +141,11 @@ func (s *localService) recycleTapLocked(tap *tapDevice) {
 	s.stageTapForPoolLocked(tap, "recycle")
 }
 
-func (s *localService) createPoolTapLocked() error {
+// createPoolTap provisions a fresh tap and stages it into the free pool. Only
+// the IP allocation (self-locked allocator) and the final staging take a lock;
+// the heavy newTap syscalls run lock-free so background inventory refills never
+// hold s.mu while creating taps.
+func (s *localService) createPoolTap() error {
 	ip, err := s.allocator.Allocate()
 	if err != nil {
 		return err
@@ -150,7 +155,9 @@ func (s *localService) createPoolTapLocked() error {
 		s.allocator.Release(ip)
 		return err
 	}
+	s.mu.Lock()
 	s.stageTapForPoolLocked(tap, "create_pool")
+	s.mu.Unlock()
 	return nil
 }
 
@@ -164,14 +171,42 @@ func (s *localService) ensureTapInventory() error {
 	}
 	need := s.cfg.TapInitNum - len(taps)
 	for i := 0; i < need; i++ {
-		s.mu.Lock()
-		err := s.createPoolTapLocked()
-		s.mu.Unlock()
-		if err != nil {
+		if err := s.createPoolTap(); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// warmupTapPoolBackground runs ensureTapInventory off the startup path
+// so NewLocalService can return immediately rather than block on
+// O(TapInitNum) tap creations. See
+// code-analysis/network/11-network-agent-async-init-plan.md for the
+// full rationale.
+//
+// On failure we log at ERROR with the partial pool size so an operator
+// can see how degraded the node is, then exit. We deliberately do NOT
+// retry or wake up the maintenance loop to backfill: keeping the pool
+// at TapInitNum is currently a passive contract (only the
+// abnormal-tap-missing path triggers a refill), and turning it into an
+// active one is a separate design change. A degraded pool is
+// functionally fine — EnsureNetwork transparently falls back to
+// creating taps on demand when the pool is empty (see
+// localService.createStateLocked, "fromPool == false" branch).
+func (s *localService) warmupTapPoolBackground() {
+	err := s.ensureTapInventory()
+	if err == nil {
+		return
+	}
+	s.mu.Lock()
+	poolSize := len(s.tapPool)
+	s.mu.Unlock()
+	missing := s.cfg.TapInitNum - poolSize
+	CubeLog.WithContext(context.Background()).Errorf(
+		"network-agent background tap pool warmup failed at pool_size=%d/target=%d: %v; "+
+			"the next %d sandbox creations will create taps on demand (~63ms extra each)",
+		poolSize, s.cfg.TapInitNum, err, missing,
+	)
 }
 
 func (s *localService) startMaintenanceLoop() {
@@ -180,6 +215,11 @@ func (s *localService) startMaintenanceLoop() {
 		defer ticker.Stop()
 		for range ticker.C {
 			s.handleAbnormalTaps()
+			// Re-fire any per-sandbox CubeEgress pushes that failed
+			// transiently in EnsureNetwork. Independent of tap
+			// recovery — a bad CubeEgress should not block tap upkeep
+			// and vice versa.
+			s.retryPendingEgressPushes()
 		}
 	}()
 }

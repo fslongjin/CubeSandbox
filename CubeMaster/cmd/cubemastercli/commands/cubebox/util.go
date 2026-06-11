@@ -10,10 +10,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"math/rand"
 	"net"
 	"net/http"
 	"os"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -150,11 +152,6 @@ func getParams(path string) ([]byte, error) {
 	return content, nil
 }
 
-func myPrint(format string, a ...any) {
-	fmt.Printf("%v,"+format+"\n",
-		append([]any{time.Now().Format(time.RFC3339Nano)}, a...)...)
-}
-
 func getServerAddrs(global *cli.Context) []string {
 	var addrs []string
 	iplistStr := global.GlobalString("address")
@@ -164,15 +161,15 @@ func getServerAddrs(global *cli.Context) []string {
 }
 
 func printRunResult(c *cli.Context) {
-	myPrint("totalRunSuccCnt:%v", totalRunSuccCnt)
-	myPrint("totalRunErr:%v", totalRunErr)
+	log.Printf("totalRunSuccCnt:%v\n", totalRunSuccCnt)
+	log.Printf("totalRunErr:%v\n", totalRunErr)
 	if totalRunSuccCnt > 0 {
-		myPrint("runMetric:")
+		log.Printf("runMetric:\n")
 		for k, v := range runMetric {
 			printPercentiles(k, v.histogram)
 			if c.Bool("printall") {
 				sort.Sort(v.data)
-				myPrint("%v:%v", k, v.data)
+				log.Printf("%v:%v\n", k, v.data)
 			}
 		}
 	}
@@ -211,7 +208,7 @@ func setpercents(c *cli.Context) {
 		if len(pertentistmp) > 0 {
 			pertentis = pertentistmp
 		}
-		myPrint("pertentis:%v", pertentis)
+		log.Printf("pertentis:%v\n", pertentis)
 	}
 }
 func printPercentiles(id string, h metrics.Histogram) {
@@ -222,7 +219,7 @@ func printPercentiles(id string, h metrics.Histogram) {
 	for i, d := range pertentis {
 		buff.WriteString(fmt.Sprintf("p%d:%d\t", int(d*100), int(ps[i]*1000)/1000))
 	}
-	myPrint("%v:[%v]", id, buff.String())
+	log.Printf("%v:[%v]\n", id, buff.String())
 }
 
 func addDestroyCost(id string, cost int64) {
@@ -245,15 +242,15 @@ func addDestroyCost(id string, cost int64) {
 	m.histogram.Update(cost)
 }
 func printDestroyResult(c *cli.Context) {
-	myPrint("totalDelSuccCnt:%v", totalDelSuccCnt)
-	myPrint("totalDelErr:%v", totalDelErr)
+	log.Printf("totalDelSuccCnt:%v\n", totalDelSuccCnt)
+	log.Printf("totalDelErr:%v\n", totalDelErr)
 	if totalDelSuccCnt > 0 {
-		myPrint("removeMetric:")
+		log.Printf("removeMetric:\n")
 		for k, v := range removeMetric {
 			printPercentiles(k, v.histogram)
 			if c.Bool("printall") {
 				sort.Sort(v.data)
-				myPrint("%v:%v", k, v.data)
+				log.Printf("%v:%v\n", k, v.data)
 			}
 		}
 	}
@@ -262,7 +259,7 @@ func printDestroyResult(c *cli.Context) {
 func printBenchStdDevResult(c *cli.Context) {
 	serverList = getServerAddrs(c)
 	if len(serverList) == 0 {
-		myPrint("no server addr")
+		log.Printf("no server addr\n")
 		return
 	}
 	port = c.GlobalString("port")
@@ -273,12 +270,12 @@ func printBenchStdDevResult(c *cli.Context) {
 	rsp := make(map[string]string)
 	err := doHttpReq(c, url, http.MethodGet, requestID, body, &rsp)
 	if err != nil {
-		myPrint("printBenchStdDevResult err. %s. RequestId: %s", err.Error(), requestID)
+		log.Printf("printBenchStdDevResult err. %s. RequestId: %s\n", err.Error(), requestID)
 		return
 	}
-	myPrint("BenchStdDevResult:")
+	log.Printf("BenchStdDevResult:\n")
 	for _, k := range []string{"pcpuUsage", "pcpuPercent", "pmemUsage", "pmemPercent", "pmvmNum", "pmvmPercent"} {
-		fmt.Printf("%s:%s\n", k, rsp[k])
+		log.Printf("%s:%s\n", k, rsp[k])
 	}
 }
 
@@ -315,7 +312,7 @@ func checkDone(cancel context.CancelFunc) {
 		if err == nil {
 			if strings.EqualFold(strings.Trim(string(data), "\n"), "1") {
 				cancel()
-				myPrint("benchrun stop")
+				log.Printf("benchrun stop\n")
 				return
 			}
 		}
@@ -332,6 +329,7 @@ func doHttpReq(c *cli.Context, url, method, requestID string, body io.Reader, rs
 		ctx, cancel = context.WithCancel(ctx)
 	}
 	defer cancel()
+	body = normalizeReader(body)
 
 	httpReq, err := http.NewRequestWithContext(ctx, method, url, body)
 	if err != nil {
@@ -355,4 +353,18 @@ func doHttpReq(c *cli.Context, url, method, requestID string, body io.Reader, rs
 		return err
 	}
 	return nil
+}
+
+func normalizeReader(body io.Reader) io.Reader {
+	if body == nil {
+		return nil
+	}
+	value := reflect.ValueOf(body)
+	switch value.Kind() {
+	case reflect.Ptr, reflect.Map, reflect.Slice, reflect.Interface, reflect.Func, reflect.Chan:
+		if value.IsNil() {
+			return nil
+		}
+	}
+	return body
 }

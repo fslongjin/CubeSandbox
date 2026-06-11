@@ -1,6 +1,6 @@
 # Self-Build Deployment
 
-> If you prefer to get started without building from source, see [Quick Start](./quickstart).
+> If you prefer to get started without building from source, see [Quick Start](./quickstart.md).
 
 This guide walks you through building a Cube Sandbox release bundle from source and deploying it on a single bare-metal server. Self-build deployment is intended for **evaluation, development, and testing** purposes, and is also the starting point if you need to customize components or add compute nodes.
 
@@ -28,7 +28,7 @@ After deployment, you will have a fully functional Cube Sandbox instance with:
 | Docker | Must be installed and running |
 | root access | `install.sh` requires root privileges |
 | DNS routing | `systemd-resolved` (preferred) or `NetworkManager + dnsmasq` |
-| `tar`, `rg`, `ss` | Required by install script |
+| `tar`, `ss`, `grep`, `sed`, `awk` | Required by install script |
 
 ### Software (Build Machine)
 
@@ -142,17 +142,11 @@ The install script will:
 9. Start host processes: network-agent, cubemaster, cube-api, cubelet
 10. Run a health check (if `ONE_CLICK_RUN_QUICKCHECK=1`)
 
-After installation, add the CLI tools to your PATH:
-
-```bash
-echo 'export PATH=/usr/local/services/cubetoolbox/CubeMaster/bin:$PATH' >> ~/.bashrc
-echo 'export PATH=/usr/local/services/cubetoolbox/Cubelet/bin:$PATH' >> ~/.bashrc
-source ~/.bashrc
-```
+After installation, the installer symlinks `cubemastercli` and `cubecli` into `/usr/local/bin`.
 
 #### Adding Compute Nodes (Multi-Node Cluster)
 
-To scale beyond a single machine, you can add compute-only nodes that register to this control node. See the [Multi-Node Cluster Deployment](./multi-node-deploy) guide for full instructions.
+To scale beyond a single machine, you can add compute-only nodes that register to this control node. See the [Multi-Node Cluster Deployment](./multi-node-deploy.md) guide for full instructions.
 
 ## Verifying the Deployment
 
@@ -164,7 +158,7 @@ sudo ./smoke.sh
 
 This runs `quickcheck.sh` and verifies that the `cube-api /health` endpoint is responding.
 
-For compute-node health checks, see [Multi-Node Cluster Deployment — Verifying the Deployment](./multi-node-deploy#verifying-the-deployment).
+For compute-node health checks, see [Multi-Node Cluster Deployment — Verifying the Deployment](./multi-node-deploy.md#verifying-the-deployment).
 
 ### Test with E2B SDK
 
@@ -173,8 +167,8 @@ Set the following environment variables on your client machine:
 ```bash
 export CUBE_TEMPLATE_ID=<your-template-id>
 export E2B_API_URL=http://<target-host>:3000
-export E2B_API_KEY=dummy
-export SSL_CERT_FILE=$(mkcert -CAROOT)/rootCA.pem
+export E2B_API_KEY=e2b_000000
+export SSL_CERT_FILE=/root/.local/share/mkcert/rootCA.pem
 ```
 
 | Variable | Description |
@@ -187,6 +181,7 @@ export SSL_CERT_FILE=$(mkcert -CAROOT)/rootCA.pem
 **Run code**
 
 ```python
+import os
 from e2b_code_interpreter import Sandbox
 
 template_id = os.environ["CUBE_TEMPLATE_ID"]
@@ -199,6 +194,7 @@ with Sandbox.create(template=template_id) as sandbox:
 **Run a shell command**
 
 ```python
+import os
 from e2b_code_interpreter import Sandbox
 
 template_id = os.environ["CUBE_TEMPLATE_ID"]
@@ -211,6 +207,7 @@ with Sandbox.create(template=template_id) as sandbox:
 **Read a file inside the sandbox**
 
 ```python
+import os
 from e2b_code_interpreter import Sandbox
 
 template_id = os.environ["CUBE_TEMPLATE_ID"]
@@ -284,10 +281,12 @@ You can also point to prebuilt binaries to skip compilation:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `ONE_CLICK_DEPLOY_ROLE` | `control` | Deployment role: `control` for single-node (default). For compute-only nodes, see [Multi-Node Cluster Deployment](./multi-node-deploy) |
-| `ONE_CLICK_CONTROL_PLANE_IP` | empty | Compute-node mode only. See [Multi-Node Cluster Deployment](./multi-node-deploy#step-2-configure-environment-variables) |
-| `ONE_CLICK_CONTROL_PLANE_CUBEMASTER_ADDR` | empty | Compute-node mode only. See [Multi-Node Cluster Deployment](./multi-node-deploy#step-2-configure-environment-variables) |
+| `ONE_CLICK_DEPLOY_ROLE` | `control` | Deployment role: `control` for single-node (default). For compute-only nodes, see [Multi-Node Cluster Deployment](./multi-node-deploy.md) |
+| `ONE_CLICK_CONTROL_PLANE_IP` | empty | Compute-node mode only. See [Multi-Node Cluster Deployment](./multi-node-deploy.md#step-2-configure-environment-variables) |
+| `ONE_CLICK_CONTROL_PLANE_CUBEMASTER_ADDR` | empty | Compute-node mode only. See [Multi-Node Cluster Deployment](./multi-node-deploy.md#step-2-configure-environment-variables) |
 | `CUBE_SANDBOX_NODE_IP` | auto-detected from `eth0` | Node's primary network interface IP. Auto-detected if unset; set explicitly if your interface differs. |
+| `CUBE_SANDBOX_NETWORK_CIDR` | `192.168.0.0/18` (from `Cubelet/config/config.toml`) | cubevs local network CIDR for sandbox IP allocation. IPv4 CIDR format (e.g., `10.100.0.0/18`), mask range /8–/30. Automatically detected for host network conflicts at install time. Uses the `config.toml` default when unset. |
+| `CUBE_SANDBOX_NETWORK_CIDR_SKIP_CONFLICT_CHECK` | `0` | Set to `1` to skip CIDR conflict detection (not recommended). Used together with `CUBE_SANDBOX_NETWORK_CIDR`. |
 | `ONE_CLICK_INSTALL_PREFIX` | `/usr/local/services/cubetoolbox` | Installation directory |
 | `ONE_CLICK_RUN_QUICKCHECK` | `1` | Run health check after installation |
 | `ONE_CLICK_RUNTIME_DIR` | `/var/run/cube-sandbox-one-click` | PID and runtime files directory |
@@ -317,8 +316,6 @@ You can also point to prebuilt binaries to skip compilation:
 | `CUBE_PROXY_DNS_ANSWER_IP` | `${CUBE_SANDBOX_NODE_IP}` | IP returned by CoreDNS for `cube.app` |
 | `CUBE_PROXY_COREDNS_BIND_ADDR` | `127.0.0.54` | CoreDNS bind address |
 | `ONE_CLICK_MKCERT_BIN` | `assets/bin/mkcert` (bundled) | Override path to mkcert binary at build time |
-| `ALPINE_MIRROR_URL` | Tsinghua mirror | Alpine package mirror for CubeProxy build |
-| `PIP_INDEX_URL` | Tsinghua mirror | PyPI mirror for CubeProxy build |
 
 ### Process Addresses
 
@@ -419,22 +416,6 @@ Common causes:
 - Port conflicts (3306 or 6379 already in use)
 - Insufficient disk space for Docker volumes
 - Docker daemon issues
-
-### ripgrep (`rg`) Not Installed
-
-```
-Error: required command not found: rg
-```
-
-Install ripgrep:
-
-```bash
-# Ubuntu/Debian
-sudo apt-get install ripgrep
-
-# CentOS/RHEL
-sudo yum install ripgrep
-```
 
 ## Known Limitations
 

@@ -9,13 +9,13 @@ export GO111MODULE=on
 export GOARCH=amd64
 export GOOS=linux
 GO_BIN_DIR := $(shell if [ -n "$$(go env GOBIN)" ]; then printf "%s" "$$(go env GOBIN)"; else printf "%s/bin" "$$(go env GOPATH)"; fi)
-PROTOBUF_INCLUDE_DIR := $(shell python3 -c 'import glob, os, subprocess; candidates = ["/usr/include", "/usr/local/include"]; gopath = subprocess.check_output(["go", "env", "GOPATH"], text=True).strip(); candidates = (glob.glob(os.path.join(gopath, "pkg/mod/github.com/google/gnostic-models@*/third_party")) + glob.glob(os.path.join(gopath, "pkg/mod/github.com/gogo/protobuf@*/protobuf")) + candidates) if gopath else candidates; print(next((c for c in candidates if os.path.exists(os.path.join(c, "google/protobuf/empty.proto")) and os.path.exists(os.path.join(c, "google/protobuf/any.proto"))), ""))')
+PROTOBUF_INCLUDE_DIR := $(shell python3 -c 'import glob, os, subprocess; candidates = ["/usr/include", "/usr/local/include"]; gopath = subprocess.check_output(["go", "env", "GOPATH"], text=True).strip(); extras = glob.glob(os.path.join(gopath, "pkg/mod/github.com/google/gnostic-models@*/third_party")) if gopath else []; candidates.extend(extras); print(next((c for c in candidates if os.path.exists(os.path.join(c, "google/protobuf/empty.proto")) and os.path.exists(os.path.join(c, "google/protobuf/any.proto"))), ""))')
 PROTOC_INCLUDE_FLAGS=-I=.
 ifneq ($(strip $(PROTOBUF_INCLUDE_DIR)),)
 PROTOC_INCLUDE_FLAGS += -I=$(PROTOBUF_INCLUDE_DIR)
 endif
 PROTOC_GO_FLAGS=--go_out=. --go_opt=paths=source_relative --go-grpc_out=. --go-grpc_opt=paths=source_relative
-PROTO_DOC_FILES=$(shell rg --files api -g '*.proto' | sort | tr '\n' ' ')
+PROTO_DOC_FILES=$(shell python3 -c 'import glob; print(" ".join(sorted(glob.glob("api/**/*.proto", recursive=True))))')
 export PATH := $(GO_BIN_DIR):$(PATH)
 
 ifeq ($(V),1)
@@ -39,20 +39,23 @@ COVERAGE_PACKAGES=$(shell go list ./... \
 	| grep -v github.com/tencentcloud/CubeSandbox/Cubelet/runtime \
 	| grep -v /integration)
 
-# Version
-APP_VERSION=0.4.24
-GIT_INIT=$(shell git config --global --add safe.directory $(PWD))
-GO_VERSION=$(shell go version | awk '{print $$3}')
-GIT_COMMIT=$(shell git rev-parse --short HEAD)
-BUILD_DATE=$(shell date +'%Y%m%d-%H:%M:%S')
-PROTOC = $(shell protoc --version|awk '{print "protoc.v"$$2}')
-VERSION=$(APP_VERSION)-$(GIT_COMMIT)-$(BUILD_DATE)-$(GO_VERSION)-$(PROTOC)
+# Version — injected at build time via ldflags.
+# Priority: env var CUBE_VERSION/CUBE_COMMIT/CUBE_BUILD_TIME > local git/date fallback.
+CUBE_VERSION ?= $(shell git describe --tags --abbrev=0 --match 'v*' 2>/dev/null || echo 0.0.0-dev)
+CUBE_COMMIT ?= $(shell git rev-parse HEAD 2>/dev/null || echo unknown)
+CUBE_BUILD_TIME ?= $(shell date -u +'%Y-%m-%dT%H:%M:%SZ')
+
 VERSION_PKG=$(PKG)/version
-BUILD_FLAGS=-ldflags "-X '$(VERSION_PKG).Version=$(VERSION)'"
+BUILD_FLAGS=-ldflags "-s -w \
+  -X '$(VERSION_PKG).Version=$(CUBE_VERSION)' \
+  -X '$(VERSION_PKG).Commit=$(CUBE_COMMIT)' \
+  -X '$(VERSION_PKG).BuildTime=$(CUBE_BUILD_TIME)'"
+APP_VERSION ?= $(CUBE_VERSION)
+GIT_COMMIT_SHORT ?= $(shell echo $(CUBE_COMMIT) | cut -c1-7)
 PUBLISH_NAME=cubelet-$(APP_VERSION).zip
 
 # use for mark docker image tags
-APP_BUILD_VERSION=$(APP_VERSION)-$(GIT_COMMIT)
+APP_BUILD_VERSION=$(APP_VERSION)-$(GIT_COMMIT_SHORT)
 
 #
 CONF_VERSION=1.1.7
@@ -60,7 +63,7 @@ DYNAMIC_CONF_DIR=$(BUILD_DIR)/cube-cubelet-conf
 DYNAMIC_PUBLISH_NAME=cube-cubelet-conf-$(CONF_VERSION).zip
 
 
-.PHONY: build deps check-proto-tools
+.PHONY: build deps check-proto-tools fmt lint dep clean
 build: $(APPS)
 deps:
 	$(call msg,Download modules)
@@ -74,7 +77,7 @@ check-proto-tools:
 
 $(APPS): deps
 	@echo "${GOOS}"
-	@echo "${VERSION}"
+	@echo "${CUBE_VERSION}"
 	$(call msg,Build app,$@)
 	mkdir -p $(BUILD_DIR)
 	$(Q)go build -o $(BUILD_DIR)/$@ \
@@ -103,7 +106,7 @@ pack:build
 packconf:
 	$(Q)mkdir -p $(DYNAMIC_CONF_DIR)
 	$(Q)cp -rf dynamicconf/* $(DYNAMIC_CONF_DIR)/
-	$(Q)echo $(CONF_VERSION)-$(GIT_COMMIT)-$(BUILD_DATE) > $(DYNAMIC_CONF_DIR)/version
+	$(Q)echo $(CONF_VERSION)-$(GIT_COMMIT_SHORT)-$(CUBE_BUILD_TIME) > $(DYNAMIC_CONF_DIR)/version
 	$(Q)cd ./build && zip -q -r  $(BUILD_DIR)/$(DYNAMIC_PUBLISH_NAME) ./cube-cubelet-conf
 	$(Q)rm -rf $(PACK_DIR)
 
@@ -114,6 +117,9 @@ proto: check-proto-tools
 		protoc $(PROTOC_INCLUDE_FLAGS) $(PROTOC_GO_FLAGS) \
 		api/$$pkg/v1/*.proto ;\
 	done)
+	@echo pkg/networkagentclient/pb
+	$(Q)protoc $(PROTOC_INCLUDE_FLAGS) $(PROTOC_GO_FLAGS) \
+		pkg/networkagentclient/pb/network_agent.proto
 	@if command -v protoc-gen-doc >/dev/null 2>&1; then \
 		printf '  %-8s %s\n' "Generate" "proto doc"; \
 		protoc $(PROTOC_INCLUDE_FLAGS) --doc_out=./doc/ --doc_opt=markdown,cubelet-api.md $(PROTO_DOC_FILES); \
@@ -143,6 +149,10 @@ coverage:
 view:
 	$(call msg,Show coverage report)
 	$(Q)go tool cover -html=$(COVERAGE_PROFILE)
+
+fmt:
+	$(call msg,Format code)
+	$(Q)go fmt ./...
 
 lint:
 	$(call msg,Run linters)

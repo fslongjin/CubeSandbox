@@ -70,12 +70,14 @@ CubeProxy 同时提供 **HTTPS（443 端口）和 HTTP（80 端口）** 两种�
 
 ```bash
 cubemastercli tpl create-from-image \
-  --image ccr.ccs.tencentyun.com/ags-image/sandbox-code:latest \
+  --image cube-sandbox-cn.tencentcloudcr.com/cube-sandbox/sandbox-code:latest \
   --writable-layer-size 1G \
   --expose-port 49999 \
   --expose-port 49983 \
   --probe 49999
 ```
+
+> **镜像仓库说明：** 国内优先使用 `cube-sandbox-cn.tencentcloudcr.com/cube-sandbox/sandbox-code:latest`；境外访问推荐使用 `cube-sandbox-int.tencentcloudcr.com/cube-sandbox/sandbox-code:latest`。
 
 记录输出的 `template_id`。
 
@@ -96,10 +98,10 @@ openclaw gateway restart
 ```bash
 export CUBE_TEMPLATE_ID=<template-id>       # 第三步获取的模板 ID
 export E2B_API_URL=http://<节点IP>:3000     # Cube API Server 地址
-export E2B_API_KEY=dummy                    # 任意非空字符串
+export E2B_API_KEY=e2b_000000                    # 任意非空字符串
 
 # 使用 Cube 内置 mkcert 证书时才需要：
-# export SSL_CERT_FILE=$(mkcert -CAROOT)/rootCA.pem
+# export SSL_CERT_FILE=/root/.local/share/mkcert/rootCA.pem
 ```
 
 ## 5. 使用方式
@@ -147,7 +149,7 @@ Skill 文件位于 `examples/openclaw-integration/skills/cube-sandbox/SKILL.md`�
 | 现象 | 可能原因 | 解决方法 |
 |------|---------|---------|
 | Skill 未触发 | Skill 未安装 | 确认 `~/.openclaw/workspace/skills/cube-sandbox/` 存在 |
-| `SSL: CERTIFICATE_VERIFY_FAILED` | HTTPS 但未配置 CA 证书 | 设置 `SSL_CERT_FILE=$(mkcert -CAROOT)/rootCA.pem` |
+| `SSL: CERTIFICATE_VERIFY_FAILED` | HTTPS 但未配置 CA 证书 | 设置 `SSL_CERT_FILE=/root/.local/share/mkcert/rootCA.pem` |
 | `Template not found` | `CUBE_TEMPLATE_ID` 错误 | 重新运行 `cubemastercli tpl list` |
 | 域名解析失败 | DNS 未配置 | 参考 skill 中的 `/etc/hosts` 临时解决方案 |
 

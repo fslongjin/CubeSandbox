@@ -9,9 +9,12 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"reflect"
+	"runtime"
 	"syscall"
 	"time"
 
@@ -20,12 +23,16 @@ import (
 	"github.com/tencentcloud/CubeSandbox/network-agent/internal/grpcserver"
 	"github.com/tencentcloud/CubeSandbox/network-agent/internal/httpserver"
 	"github.com/tencentcloud/CubeSandbox/network-agent/internal/service"
+	"github.com/tencentcloud/CubeSandbox/network-agent/pkg/version"
 )
 
 var newLocalService = service.NewLocalService
 
 func main() {
 	defaultCfg := service.DefaultConfig()
+	var showVersion bool
+	flag.BoolVar(&showVersion, "version", false, "show version information")
+	flag.BoolVar(&showVersion, "v", false, "show version information")
 	var (
 		listenEndpoint = flag.String("listen", "unix:///tmp/cube/network-agent.sock", "network-agent listen endpoint")
 		healthListen   = flag.String("health-listen", "127.0.0.1:19090", "network-agent health server listen address")
@@ -38,7 +45,7 @@ func main() {
 		mvmGwDestIP    = flag.String("mvm-gw-dest-ip", "169.254.68.5", "guest gateway destination IP")
 		mvmGwMacAddr   = flag.String("mvm-gw-mac-addr", "20:90:6f:cf:cf:cf", "guest gateway MAC address")
 		mvmMask        = flag.Int("mvm-mask", 30, "guest mask bits")
-		mvmMTU         = flag.Int("mvm-mtu", 1300, "guest mtu")
+		mvmMTU         = flag.Int("mvm-mtu", defaultCfg.MvmMtu, "guest mtu")
 		stateDir       = flag.String("state-dir", defaultCfg.StateDir, "network-agent state directory")
 		tapFDListen    = flag.String("tap-fd-listen", "unix:///tmp/cube/network-agent-tap.sock", "unix socket for passing original tap fds to cubelet")
 		hostProxyBind  = flag.String("host-proxy-bind-ip", "127.0.0.1", "host proxy bind ip")
@@ -46,10 +53,19 @@ func main() {
 		logLevel       = flag.String("log-level", defaultLogLevel, "set the logging level [debug, info, warn, error, fatal]")
 		logRollNum     = flag.Int("log-roll-num", defaultRollNum, "network-agent log files roll number")
 		logRollSize    = flag.Int("log-roll-size", defaultRollSizeMB, "network-agent log files roll size(MB)")
+		pprofListen    = flag.String("pprof-listen", "", "optional pprof/debug http listen address (e.g. 127.0.0.1:6060); empty disables profiling")
 	)
 	flag.Parse()
+	if showVersion {
+		fmt.Println(version.String())
+		os.Exit(0)
+	}
 	if err := initLogger(*logPath, *logLevel, *logRollNum, *logRollSize); err != nil {
 		CubeLog.Fatalf("network-agent init logger failed: %v", err)
+	}
+
+	if *pprofListen != "" {
+		startProfilingServer(*pprofListen)
 	}
 
 	cfg := defaultCfg
@@ -184,6 +200,24 @@ func main() {
 	}
 }
 
+// startProfilingServer enables the Go pprof endpoints (CPU, heap, goroutine,
+// and crucially mutex/block contention) on the given address so the create hot
+// path can be profiled under load. Disabled by default; only started when
+// --pprof-listen is provided. Mutex/block profiling lets us confirm whether any
+// Go-level lock (e.g. localService.mu) is actually contended versus the cost
+// living in kernel-serialized netlink/eBPF syscalls.
+func startProfilingServer(addr string) {
+	runtime.SetMutexProfileFraction(1)
+	runtime.SetBlockProfileRate(1)
+	go func() {
+		server := &http.Server{Addr: addr, ReadHeaderTimeout: 5 * time.Second}
+		CubeLog.Infof("network-agent pprof server listening on %s", addr)
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			CubeLog.Warnf("network-agent pprof server failed: %v", err)
+		}
+	}()
+}
+
 func initService(cfg service.Config) (service.Service, error) {
 	CubeLog.Infof("network-agent initService start: config={%s}", summarizeConfig(cfg))
 	svc, err := newLocalService(cfg)
@@ -212,7 +246,7 @@ func validateService(svc service.Service) error {
 
 func summarizeConfig(cfg service.Config) string {
 	return fmt.Sprintf(
-		"eth_name=%q object_dir=%q cidr=%q mvm_inner_ip=%q mvm_mac_addr=%q mvm_gw_dest_ip=%q mvm_gw_mac_addr=%q mvm_mask=%d mvm_mtu=%d tap_init_num=%d default_exposed_ports=%v state_dir=%q tap_fd_socket_path=%q host_proxy_bind_ip=%q disable_tso=%t disable_ufo=%t disable_check_sum=%t connect_timeout=%s",
+		"eth_name=%q object_dir=%q cidr=%q mvm_inner_ip=%q mvm_mac_addr=%q mvm_gw_dest_ip=%q mvm_gw_mac_addr=%q mvm_mask=%d mvm_mtu=%d tap_init_num=%d state_dir=%q tap_fd_socket_path=%q host_proxy_bind_ip=%q connect_timeout=%s",
 		cfg.EthName,
 		cfg.ObjectDir,
 		cfg.CIDR,
@@ -223,13 +257,9 @@ func summarizeConfig(cfg service.Config) string {
 		cfg.MvmMask,
 		cfg.MvmMtu,
 		cfg.TapInitNum,
-		cfg.DefaultExposedPorts,
 		cfg.StateDir,
 		cfg.TapFDSocketPath,
 		cfg.HostProxyBindIP,
-		cfg.DisableTso,
-		cfg.DisableUfo,
-		cfg.DisableCheckSum,
 		cfg.ConnectTimeout,
 	)
 }

@@ -1,0 +1,170 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ONE_CLICK_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+TMP_DIR="$(mktemp -d)"
+cleanup() {
+  rm -rf "${TMP_DIR}"
+}
+trap cleanup EXIT
+
+export ONE_CLICK_TOOLBOX_ROOT="${TMP_DIR}/toolbox"
+export ONE_CLICK_RUNTIME_DIR="${TMP_DIR}/run"
+export ONE_CLICK_LOG_DIR="${TMP_DIR}/log"
+
+# shellcheck source=../lib/common.sh
+source "${ONE_CLICK_DIR}/lib/common.sh"
+# shellcheck source=../scripts/one-click/common.sh
+source "${ONE_CLICK_DIR}/scripts/one-click/common.sh"
+
+fail() {
+  echo "FAIL: $*" >&2
+  exit 1
+}
+
+assert_file() {
+  [[ -f "$1" ]] || fail "expected file: $1"
+}
+
+assert_contains() {
+  local path="$1"
+  local needle="$2"
+  grep -Fq -- "${needle}" "${path}" || fail "expected ${path} to contain ${needle}"
+}
+
+assert_not_contains() {
+  local path="$1"
+  local needle="$2"
+  if grep -Fq -- "${needle}" "${path}"; then
+    fail "expected ${path} not to contain ${needle}"
+  fi
+}
+
+test_render_template_replaces_empty_directory() {
+  local template="${TMP_DIR}/template.conf"
+  local output="${TMP_DIR}/generated.conf"
+
+  printf 'hello __NAME__\n' > "${template}"
+  mkdir -p "${output}"
+
+  render_template_atomic \
+    "${template}" \
+    "${output}" \
+    -e "s/__NAME__/cube/g"
+
+  assert_file "${output}"
+  assert_contains "${output}" "hello cube"
+}
+
+test_render_template_rejects_non_empty_directory() {
+  local template="${TMP_DIR}/template-non-empty.conf"
+  local output="${TMP_DIR}/generated-non-empty.conf"
+
+  printf 'hello\n' > "${template}"
+  mkdir -p "${output}"
+  printf 'keep\n' > "${output}/content"
+
+  if (
+    render_template_atomic \
+      "${template}" \
+      "${output}" \
+      -e "s/hello/world/g"
+  ) >/dev/null 2>&1; then
+    fail "expected non-empty output directory to be rejected"
+  fi
+}
+
+test_unit_prepare_hooks_are_wired() {
+  assert_contains "${ONE_CLICK_DIR}/systemd/cube-sandbox-mysql.service" "/usr/local/services/cubetoolbox/scripts/systemd/mysql-prepare.sh"
+  assert_contains "${ONE_CLICK_DIR}/systemd/cube-sandbox-redis.service" "/usr/local/services/cubetoolbox/scripts/systemd/redis-prepare.sh"
+  assert_contains "${ONE_CLICK_DIR}/systemd/cube-sandbox-coredns.service" "/usr/local/services/cubetoolbox/scripts/systemd/coredns-prepare.sh"
+  assert_contains "${ONE_CLICK_DIR}/systemd/cube-sandbox-coredns.service" "/usr/local/services/cubetoolbox/scripts/systemd/coredns-postcheck.sh"
+  assert_contains "${ONE_CLICK_DIR}/systemd/cube-sandbox-cube-proxy.service" "/usr/local/services/cubetoolbox/scripts/systemd/cube-proxy-prepare.sh"
+  assert_contains "${ONE_CLICK_DIR}/systemd/cube-sandbox-webui.service" "/usr/local/services/cubetoolbox/scripts/systemd/webui-prepare.sh"
+}
+
+test_support_compose_render_is_locked_and_atomic() {
+  local path="${ONE_CLICK_DIR}/scripts/one-click/up-support.sh"
+
+  assert_contains "${path}" "require_cmd flock"
+  assert_contains "${path}" "flock -x 9"
+  assert_contains "${path}" "render_template_atomic"
+  assert_not_contains "${path}" "> \"\${SUPPORT_COMPOSE_FILE}\""
+}
+
+test_compose_wrappers_reject_directories() {
+  assert_contains "${ONE_CLICK_DIR}/scripts/one-click/compose-lib.sh" "ensure_bind_mount_file \"\${COMPOSE_FILE}\""
+  assert_contains "${ONE_CLICK_DIR}/scripts/one-click/webui-compose-lib.sh" "ensure_bind_mount_file \"\${WEBUI_COMPOSE_FILE}\""
+  assert_contains "${ONE_CLICK_DIR}/scripts/one-click/coredns-compose-lib.sh" "ensure_bind_mount_file \"\${COREDNS_COMPOSE_FILE}\""
+  assert_contains "${ONE_CLICK_DIR}/scripts/one-click/support-compose-lib.sh" "ensure_bind_mount_file \"\${SUPPORT_COMPOSE_FILE}\""
+}
+
+test_coredns_direct_outputs_prepare_file_path() {
+  assert_contains "${ONE_CLICK_DIR}/scripts/one-click/up-dns.sh" "prepare_file_output \"\${dst_path}\""
+  assert_contains "${ONE_CLICK_DIR}/scripts/systemd/coredns-start.sh" "prepare_file_output \"\${dst_path}\""
+  assert_contains "${ONE_CLICK_DIR}/scripts/systemd/common.sh" "wait_for_udp_port()"
+  assert_not_contains "${ONE_CLICK_DIR}/scripts/systemd/common.sh" "require_cmd rg"
+}
+
+test_unit_dependency_order() {
+  assert_contains "${ONE_CLICK_DIR}/systemd/cube-sandbox-cube-proxy.service" "After=docker.service network-online.target cube-sandbox-redis.service cube-sandbox-dns.service"
+  assert_contains "${ONE_CLICK_DIR}/systemd/cube-sandbox-cubemaster.service" "After=network-online.target cube-sandbox-mysql.service cube-sandbox-redis.service"
+  assert_contains "${ONE_CLICK_DIR}/systemd/cube-sandbox-cube-api.service" "After=network-online.target cube-sandbox-cubemaster.service"
+  assert_contains "${ONE_CLICK_DIR}/systemd/cube-sandbox-webui.service" "After=docker.service network-online.target cube-sandbox-cube-api.service"
+}
+
+test_detect_glibc_version_consumes_full_ldd_output() {
+  ldd() {
+    printf 'ldd (GNU libc) 2.39\n'
+    seq 1 100000
+  }
+
+  local version
+  version="$(detect_glibc_version)" || fail "expected detect_glibc_version to succeed with long ldd output"
+  [[ "${version}" == "2.39" ]] || fail "expected glibc version 2.39, got ${version}"
+}
+
+test_online_install_glibc_detection_avoids_head_pipe() {
+  local path="${ONE_CLICK_DIR}/online-install.sh"
+
+  assert_contains "${path}" "detect_glibc_version()"
+  assert_contains "${path}" "ldd_output=\"\$(ldd --version 2>&1)\""
+  assert_not_contains "${path}" "ldd --version 2>&1 | head -1 | awk '{print \$NF}'"
+}
+
+test_one_click_scripts_do_not_require_ripgrep() {
+  assert_not_contains "${ONE_CLICK_DIR}/install.sh" "require_cmd rg"
+  assert_not_contains "${ONE_CLICK_DIR}/install.sh" "install_ripgrep"
+  assert_not_contains "${ONE_CLICK_DIR}/lib/common.sh" "install_ripgrep"
+  assert_not_contains "${ONE_CLICK_DIR}/scripts/one-click/common.sh" "require_cmd rg"
+  assert_not_contains "${ONE_CLICK_DIR}/scripts/systemd/common.sh" "require_cmd rg"
+  assert_not_contains "${ONE_CLICK_DIR}/scripts/one-click/up-with-deps.sh" "require_cmd rg"
+  assert_not_contains "${ONE_CLICK_DIR}/scripts/one-click/down-with-deps.sh" "require_cmd rg"
+  assert_not_contains "${ONE_CLICK_DIR}/scripts/one-click/up-webui.sh" "require_cmd rg"
+  assert_not_contains "${ONE_CLICK_DIR}/scripts/one-click/up-compute.sh" "require_cmd rg"
+  assert_not_contains "${ONE_CLICK_DIR}/scripts/systemd/prepare-compute-role.sh" "require_cmd rg"
+}
+
+test_quickcheck_reports_node_registration_failure_explicitly() {
+  local path="${ONE_CLICK_DIR}/scripts/one-click/quickcheck.sh"
+
+  assert_contains "${path}" "failed to query cubemaster node registration"
+  assert_contains "${path}" "cubemaster node registration missing host_ip="
+  assert_not_contains "${path}" "| rg -q"
+}
+
+test_render_template_replaces_empty_directory
+test_render_template_rejects_non_empty_directory
+test_unit_prepare_hooks_are_wired
+test_support_compose_render_is_locked_and_atomic
+test_compose_wrappers_reject_directories
+test_coredns_direct_outputs_prepare_file_path
+test_unit_dependency_order
+test_detect_glibc_version_consumes_full_ldd_output
+test_online_install_glibc_detection_avoids_head_pipe
+test_one_click_scripts_do_not_require_ripgrep
+test_quickcheck_reports_node_registration_failure_explicitly
+
+echo "runtime file safety tests OK"

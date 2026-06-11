@@ -15,14 +15,30 @@ CLIENT_PROTO := $(CLIENT_PROTO_DIR)/network_agent.proto
 APP := network-agent
 GO_BIN_DIR := $(shell if [ -n "$$(go env GOBIN)" ]; then printf "%s" "$$(go env GOBIN)"; else printf "%s/bin" "$$(go env GOPATH)"; fi)
 
+# Version — injected at build time via ldflags.
+# Priority: env var CUBE_VERSION/CUBE_COMMIT/CUBE_BUILD_TIME > local git/date fallback.
+CUBE_VERSION ?= $(shell git describe --tags --abbrev=0 --match 'v*' 2>/dev/null || echo 0.0.0-dev)
+CUBE_COMMIT ?= $(shell git rev-parse HEAD 2>/dev/null || echo unknown)
+CUBE_BUILD_TIME ?= $(shell date -u +'%Y-%m-%dT%H:%M:%SZ')
+
+VERSION_PKG := github.com/tencentcloud/CubeSandbox/network-agent/pkg/version
+LDFLAGS := -ldflags "-s -w \
+  -X '$(VERSION_PKG).Version=$(CUBE_VERSION)' \
+  -X '$(VERSION_PKG).Commit=$(CUBE_COMMIT)' \
+  -X '$(VERSION_PKG).BuildTime=$(CUBE_BUILD_TIME)'"
+
 export PATH := $(GO_BIN_DIR):$(PATH)
 
-.PHONY: build proto test clean check-proto-tools sync-client-proto
+.PHONY: build fmt proto test clean check-proto-tools sync-client-proto
 
 build:
 	$(call msg,Build app,$(APP))
 	$(Q)mkdir -p "$(BUILD_DIR)"
-	$(Q)go build -o "$(BUILD_DIR)/$(APP)" ./cmd/$(APP)
+	$(Q)go build $(LDFLAGS) -o "$(BUILD_DIR)/$(APP)" ./cmd/$(APP)
+
+fmt:
+	$(call msg,Format code,$(APP))
+	$(Q)go fmt ./...
 
 check-proto-tools:
 	@command -v protoc >/dev/null 2>&1 || { echo "error: protoc not installed"; exit 1; }

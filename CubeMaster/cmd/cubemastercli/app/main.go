@@ -19,7 +19,7 @@ var extraCmds = []cli.Command{}
 
 func init() {
 	cli.VersionPrinter = func(c *cli.Context) {
-		fmt.Println(c.App.Name, pkgv.Package, c.App.Version)
+		fmt.Println(pkgv.VersionString("cubemastercli"))
 	}
 }
 
@@ -54,6 +54,10 @@ func New() *cli.App {
 		cubebox.MultiRun,
 		cubebox.ListCommand,
 		cubebox.InfoCommand,
+		cubebox.SandboxCommand,
+		cubebox.SnapshotCommand,
+		cubebox.StorageCommand,
+		cubebox.OperationCommand,
 		cubebox.NodeCommand,
 		cubebox.TemplateCommand,
 		cubebox.ListInventoryCommand,

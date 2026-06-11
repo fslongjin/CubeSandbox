@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2026 Tencent. All rights reserved.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -21,36 +23,25 @@ fi
 DEPLOY_ROLE="$(one_click_deploy_role)"
 TOOLBOX_ROOT="${ONE_CLICK_TOOLBOX_ROOT:-/usr/local/services/cubetoolbox}"
 INSTALL_PREFIX="${ONE_CLICK_INSTALL_PREFIX:-${TOOLBOX_ROOT}}"
-
-detect_shell_rc_file() {
-  local shell_name
-  shell_name="$(basename "${SHELL:-}")"
-  case "${shell_name}" in
-    zsh)
-      printf '%s\n' '~/.zshrc'
-      ;;
-    bash)
-      printf '%s\n' '~/.bashrc'
-      ;;
-    *)
-      printf '%s\n' 'your shell rc file (for example ~/.bashrc or ~/.zshrc)'
-      ;;
-  esac
-}
+CUBE_PVM_ENABLE="${CUBE_PVM_ENABLE:-0}"
+case "${CUBE_PVM_ENABLE}" in
+  0|1) ;;
+  *) die "unsupported CUBE_PVM_ENABLE: ${CUBE_PVM_ENABLE} (expected 0 or 1)" ;;
+esac
 
 print_path_hint() {
-  local rc_file
-  rc_file="$(detect_shell_rc_file)"
-
-  cat >&2 <<EOF
-
-[one-click] Add the following directories to PATH in ${rc_file}:
-[one-click]   ${INSTALL_PREFIX}/CubeMaster/bin
-[one-click]   ${INSTALL_PREFIX}/Cubelet/bin
-[one-click] Example:
-[one-click]   export PATH=${INSTALL_PREFIX}/CubeMaster/bin:${INSTALL_PREFIX}/Cubelet/bin:\$PATH
-
-EOF
+  {
+    echo
+    echo "[one-click] Installed public commands in /usr/local/bin:"
+    echo "[one-click]   cube-runtime"
+    echo "[one-click]   containerd-shim-cube-rs"
+    echo "[one-click]   cubecli"
+    echo "[one-click]   cubevsmapdump"
+    if [[ "${DEPLOY_ROLE}" != "compute" ]]; then
+      echo "[one-click]   cubemastercli"
+    fi
+    echo
+  } >&2
 }
 
 detect_installed_role() {
@@ -58,11 +49,7 @@ detect_installed_role() {
     return 0
   fi
 
-  local installed_role_line
-  installed_role_line="$(rg '^ONE_CLICK_DEPLOY_ROLE=' "${INSTALL_PREFIX}/.one-click.env" || true)"
-  if [[ -n "${installed_role_line}" ]]; then
-    printf '%s\n' "${installed_role_line#ONE_CLICK_DEPLOY_ROLE=}"
-  fi
+  sed -n '/^ONE_CLICK_DEPLOY_ROLE=/{s/^ONE_CLICK_DEPLOY_ROLE=//;p;q;}' "${INSTALL_PREFIX}/.one-click.env" 2>/dev/null || true
 }
 
 needs_docker_for_install() {
@@ -83,6 +70,15 @@ require_any_cmd() {
     fi
   done
   die "requires one of commands: $*"
+}
+
+install_required_dependencies() {
+  log "checking and installing dependencies..."
+
+  if needs_docker_for_install; then
+    install_docker
+    install_docker_compose
+  fi
 }
 
 check_dns_preflight() {
@@ -109,16 +105,186 @@ check_proxy_cert_preflight() {
   :
 }
 
+restore_selinux_contexts() {
+  command -v restorecon >/dev/null 2>&1 || return 0
+  if command -v selinuxenabled >/dev/null 2>&1; then
+    selinuxenabled || return 0
+  elif [[ ! -d /sys/fs/selinux ]]; then
+    return 0
+  fi
+
+  log "restoring SELinux contexts under ${INSTALL_PREFIX}"
+  restorecon -R "${INSTALL_PREFIX}"
+}
+
+one_click_runtime_file_paths() {
+  [[ "${DEPLOY_ROLE}" != "compute" ]] || return 0
+
+  printf '%s\n' \
+    "${INSTALL_PREFIX}/cubeproxy/global.conf" \
+    "${INSTALL_PREFIX}/cubeproxy/nginx.conf" \
+    "${INSTALL_PREFIX}/webui/nginx.generated.conf" \
+    "${INSTALL_PREFIX}/coredns/Corefile" \
+    "${INSTALL_PREFIX}/coredns/resolv.conf.upstream"
+}
+
+check_runtime_file_paths_not_directories() {
+  local path
+  while IFS= read -r path; do
+    [[ -n "${path}" ]] || continue
+    if [[ ! -d "${path}" ]]; then
+      continue
+    fi
+    if rmdir "${path}" 2>/dev/null; then
+      log "removed empty directory at runtime file path: ${path}"
+      continue
+    fi
+    die "runtime file path is a non-empty directory: ${path}; move it away and retry"
+  done < <(one_click_runtime_file_paths)
+}
+
+generate_cubemaster_config_ports() {
+  [[ "${DEPLOY_ROLE}" != "compute" ]] || return 0
+
+  local cfg="${PKG_ROOT}/CubeMaster/conf.yaml"
+  local mysql_port="${CUBE_SANDBOX_MYSQL_PORT:-3306}"
+  local redis_port="${CUBE_SANDBOX_REDIS_PORT:-6379}"
+
+  ensure_file "${cfg}"
+  sed -i \
+    -e "s|__CUBE_SANDBOX_MYSQL_PORT__|${mysql_port}|g" \
+    -e "s|__CUBE_SANDBOX_REDIS_PORT__|${redis_port}|g" \
+    "${cfg}"
+}
+
 check_hardware_preflight() {
   if [[ ! -e /dev/kvm ]]; then
+    log "KVM is not supported or not enabled (/dev/kvm not found)."
+    log ""
+    log "If this host cannot expose hardware KVM (for example, it is itself a"
+    log "virtual machine without nested virtualization), you can try the"
+    log "open-source PVM stack shipped under deploy/pvm/ to turn the current"
+    log "guest into a PVM host that provides /dev/kvm to CubeSandbox:"
+    log ""
+    log "    sudo bash deploy/pvm/pvm_setup.sh"
+    log ""
+    log "That script will build and install a PVM-enabled host kernel, build a"
+    log "matching PVM guest vmlinux, and guide you through the reboot needed to"
+    log "switch into the new kernel. After reboot, re-run this installer."
+    log ""
+    log "WARNING: the open-source kvm-pvm integration is intended for"
+    log "development, evaluation and self-built experiments only. It is NOT"
+    log "suitable for production workloads -- expect reduced performance,"
+    log "limited hardware coverage and no long-term support guarantees."
     die "KVM is not supported or not enabled (/dev/kvm not found)."
   fi
 
   local mem_total_kb
   mem_total_kb="$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
-  if [[ "${mem_total_kb}" -lt 7500000 ]]; then
-    die "System memory must be at least 8GB."
+  
+  local min_mem_kb=7500000
+  if [[ -n "${CUBE_MIN_MEMORY_KB:-}" ]]; then
+    if [[ "${CUBE_MIN_MEMORY_KB}" =~ ^[0-9]+$ ]] && [[ "${CUBE_MIN_MEMORY_KB}" -gt 0 ]]; then
+      # Enforce that the threshold cannot be lower than the default 8GB (7500000 KB) in the authoritative installer
+      if [[ "${CUBE_MIN_MEMORY_KB}" -ge 7500000 ]]; then
+        min_mem_kb="${CUBE_MIN_MEMORY_KB}"
+      fi
+    else
+      die "Invalid CUBE_MIN_MEMORY_KB '${CUBE_MIN_MEMORY_KB}' (must be a positive integer greater than 0)."
+    fi
   fi
+
+  if [[ "${mem_total_kb}" -lt "${min_mem_kb}" ]]; then
+    die "System memory must be at least $((min_mem_kb / 1024 / 1024))GB (found $((mem_total_kb / 1024 / 1024)) GB)."
+  fi
+}
+
+# Check PVM host consistency: if the kvm_pvm kernel module is loaded,
+# CUBE_PVM_ENABLE must be set to 1. Otherwise the installer will use the
+# ordinary guest kernel (vmlinux) instead of the PVM-optimized one
+# (vmlinux-pvm), which causes VM template creation to fail later with
+# minimal error messages.
+#
+# This check runs after check_hardware_preflight (which validates /dev/kvm)
+# and before any filesystem or cgroup checks, so the user gets a clear
+# fail-fast message before the installer touches the system.
+check_pvm_consistency_preflight() {
+  local has_kvm_pvm=0
+  if lsmod 2>/dev/null | grep -qE '^kvm_pvm[[:space:]]'; then
+    has_kvm_pvm=1
+  fi
+
+  # Not a PVM host — nothing to check.
+  if [[ "${has_kvm_pvm}" -eq 0 ]]; then
+    return 0
+  fi
+
+  # PVM host detected, CUBE_PVM_ENABLE is already set correctly.
+  if [[ "${CUBE_PVM_ENABLE}" == "1" ]]; then
+    log "PVM host detected (kvm_pvm loaded) and CUBE_PVM_ENABLE=1 — proceeding with PVM guest kernel."
+    return 0
+  fi
+
+  # PVM host detected but CUBE_PVM_ENABLE is NOT set to 1.
+  # This is the dangerous case: the installer will use the ordinary guest
+  # kernel, and VM template creation will fail later.
+
+  cat >&2 <<'EOF'
+
+╔══════════════════════════════════════════════════════════════════╗
+║  [!!] PVM HOST DETECTED -- CUBE_PVM_ENABLE NOT SET             ║
+╠══════════════════════════════════════════════════════════════════╣
+║                                                                  ║
+║  The kvm_pvm kernel module is loaded on this host -- this        ║
+║  machine is running as a PVM host.                               ║
+║                                                                  ║
+║  However, CUBE_PVM_ENABLE is not set to 1. The installer will    ║
+║  use the ordinary guest kernel (vmlinux) instead of the PVM-     ║
+║  optimized guest kernel (vmlinux-pvm).                           ║
+║                                                                  ║
+║  [!!] VM template creation will fail with minimal error          ║
+║       messages if the wrong guest kernel is used.                ║
+║                                                                  ║
+║  Solution: re-run with CUBE_PVM_ENABLE=1:                        ║
+║                                                                  ║
+║    CUBE_PVM_ENABLE=1 ./install.sh                                ║
+║                                                                  ║
+║  To bypass this check (not recommended):                         ║
+║                                                                  ║
+║    ONE_CLICK_SKIP_PVM_CHECK=1 ./install.sh                       ║
+║                                                                  ║
+║  Docs: https://cubesandbox.com/guide/pvm-deploy.html             ║
+║                                                                  ║
+╚══════════════════════════════════════════════════════════════════╝
+
+EOF
+
+  # Check if the user has explicitly opted to skip this check.
+  if [[ "${ONE_CLICK_SKIP_PVM_CHECK:-0}" == "1" ]]; then
+    log "ONE_CLICK_SKIP_PVM_CHECK=1 — bypassing PVM consistency check (not recommended)."
+    return 0
+  fi
+
+  # Non-interactive environment: fail fast with a clear error.
+  if [[ ! -t 0 ]]; then
+    die "PVM host detected but CUBE_PVM_ENABLE is not 1, and stdin is not a terminal.
+Re-run with CUBE_PVM_ENABLE=1 to use the PVM guest kernel, or set
+ONE_CLICK_SKIP_PVM_CHECK=1 to bypass this check (not recommended).
+See: https://cubesandbox.com/guide/pvm-deploy.html"
+  fi
+
+  # Interactive: ask the user to confirm.
+  printf '\n%s' "Proceed WITHOUT PVM guest kernel support? This may cause VM template failures. [y/N]: "
+  read -r reply
+  case "${reply}" in
+    [Yy]|[Yy][Ee][Ss])
+      log "User acknowledged the risk — proceeding with ordinary guest kernel on PVM host."
+      ;;
+    *)
+      die "Installation aborted. Re-run with CUBE_PVM_ENABLE=1 to use the PVM guest kernel.
+See: https://cubesandbox.com/guide/pvm-deploy.html"
+      ;;
+  esac
 }
 
 check_cubelet_fs_preflight() {
@@ -145,7 +311,8 @@ check_cubelet_fs_preflight() {
     die "/data/cubelet is a mount point but its filesystem type is '${fs_type}' (requires xfs).
   Please format the underlying partition as XFS and remount it at /data/cubelet:
     mkfs.xfs /dev/<your-partition>
-    mount /dev/<your-partition> /data/cubelet"
+    mount /dev/<your-partition> /data/cubelet
+  Troubleshooting: https://github.com/TencentCloud/CubeSandbox/issues/311"
   else
     die "The filesystem that will host /data/cubelet is on '${check_path}' (type: ${fs_type:-unknown}), which is not XFS.
   Cube Sandbox requires the /data/cubelet directory to reside on an XFS filesystem.
@@ -153,20 +320,65 @@ check_cubelet_fs_preflight() {
     1. Mount a dedicated XFS-formatted partition at /data/cubelet:
          mkfs.xfs /dev/<your-partition>
          mount /dev/<your-partition> /data/cubelet
-    2. Ensure the parent path (${check_path}) itself is on XFS."
+    2. Ensure the parent path (${check_path}) itself is on XFS.
+  Troubleshooting: https://github.com/TencentCloud/CubeSandbox/issues/311"
   fi
+}
+
+check_cgroup_cpu_preflight() {
+  local cgroot="/sys/fs/cgroup"
+  local fstype
+  fstype="$(stat -fc %T "${cgroot}" 2>/dev/null || echo unknown)"
+
+  # cgroup v1 systems still work via the v1 handle in cubelet; only validate
+  # cgroup v2 hosts here (which is what every recent distro defaults to).
+  if [[ "${fstype}" != "cgroup2fs" ]]; then
+    return 0
+  fi
+
+  local controllers=""
+  if [[ -r "${cgroot}/cgroup.controllers" ]]; then
+    controllers="$(cat "${cgroot}/cgroup.controllers" 2>/dev/null || true)"
+  fi
+  if ! grep -qw cpu <<<"${controllers}"; then
+    die "Kernel cgroup v2 does not expose the 'cpu' controller (cgroup.controllers='${controllers:-<empty>}').
+  cubelet cannot set CPU quotas without it.
+  See: https://github.com/TencentCloud/CubeSandbox/issues/366"
+  fi
+
+  local subtree=""
+  if [[ -r "${cgroot}/cgroup.subtree_control" ]]; then
+    subtree="$(cat "${cgroot}/cgroup.subtree_control" 2>/dev/null || true)"
+  fi
+  if grep -qw cpu <<<"${subtree}"; then
+    return 0
+  fi
+
+  log "cgroup v2 'cpu' controller not enabled on ${cgroot}/cgroup.subtree_control; trying to enable it"
+  if printf '+cpu\n' >"${cgroot}/cgroup.subtree_control" 2>/dev/null; then
+    log "enabled '+cpu' on ${cgroot}/cgroup.subtree_control"
+    return 0
+  fi
+
+  die "Failed to enable the cgroup v2 'cpu' controller on ${cgroot}/cgroup.subtree_control.
+  On Ubuntu / Debian this is usually caused by 'multipathd' (or another service) running real-time threads under the root cgroup, which blocks '+cpu' with 'Invalid argument'.
+  Quick fix:
+    systemctl disable --now multipathd.service multipathd.socket
+    echo +cpu > ${cgroot}/cgroup.subtree_control
+  Full repro and fix: https://github.com/TencentCloud/CubeSandbox/issues/366"
 }
 
 check_install_preflight() {
   # install.sh itself.
   require_cmd tar
-  require_cmd rg
   require_cmd ss
+  require_cmd systemctl
 
   # runtime common helpers used by up/down scripts.
   require_cmd bash
   require_cmd curl
   require_cmd sed
+  require_cmd grep
   require_cmd pgrep
   require_cmd date
 
@@ -184,6 +396,23 @@ check_install_preflight() {
     require_cmd ip
     check_proxy_cert_preflight
     check_dns_preflight
+  fi
+}
+
+select_installed_kernel_vmlinux() {
+  local kernel_dir="${INSTALL_PREFIX}/cube-kernel-scf"
+  local target="vmlinux-bm"
+
+  if [[ "${CUBE_PVM_ENABLE}" == "1" ]]; then
+    target="vmlinux-pvm"
+  fi
+
+  ensure_file "${kernel_dir}/${target}"
+  ln -sfn "${target}" "${kernel_dir}/vmlinux"
+  if [[ "${target}" == "vmlinux-pvm" ]]; then
+    log "CUBE_PVM_ENABLE=1, selected PVM guest kernel: ${kernel_dir}/vmlinux -> ${target}"
+  else
+    log "selected ordinary guest kernel: ${kernel_dir}/vmlinux -> ${target}"
   fi
 }
 
@@ -236,15 +465,107 @@ PY
   fi
 }
 
+systemd_target_for_role() {
+  local role="$1"
+  case "${role}" in
+    control)
+      printf '%s\n' "cube-sandbox-control.target"
+      ;;
+    compute)
+      printf '%s\n' "cube-sandbox-compute.target"
+      ;;
+    *)
+      die "unsupported role for systemd target: ${role}"
+      ;;
+  esac
+}
+
+stop_existing_systemd_deployment() {
+  # Disable + stop the targets first; PartOf= on each child service is
+  # supposed to cascade the stop. In practice, units that are stuck in
+  # `failed` or `activating` state don't always get cleaned up by the
+  # target stop alone — typically `cube-sandbox-cube-egress-net.service`
+  # blocked on a missing cube-dev interface, leaving its requirer
+  # `cube-sandbox-cube-egress.service` perpetually inactive.
+  #
+  # So we belt-and-suspenders explicitly stop every cube-sandbox-*
+  # service afterwards, which both forces failed units back to inactive
+  # and guarantees the next `enable --now <target>` actually re-runs
+  # ExecStart instead of returning a "no-op, already active" exit 0.
+  systemctl disable --now \
+    cube-sandbox-control.target \
+    cube-sandbox-compute.target >/dev/null 2>&1 || true
+  systemctl reset-failed 'cube-sandbox-*.service' >/dev/null 2>&1 || true
+  systemctl stop 'cube-sandbox-*.service' >/dev/null 2>&1 || true
+}
+
+stop_existing_legacy_deployment() {
+  # Legacy bridge for upgrading pre-systemd one-click installs.
+  # New installs are systemd-only; this path only stops old nohup/pidfile deployments
+  # before the install prefix is replaced.
+  local installed_role="$1"
+  local legacy_stop_script=""
+
+  if [[ "${installed_role}" == "compute" && -x "${INSTALL_PREFIX}/scripts/one-click/down-compute.sh" ]]; then
+    legacy_stop_script="${INSTALL_PREFIX}/scripts/one-click/down-compute.sh"
+  elif [[ -x "${INSTALL_PREFIX}/scripts/one-click/down-with-deps.sh" ]]; then
+    legacy_stop_script="${INSTALL_PREFIX}/scripts/one-click/down-with-deps.sh"
+  fi
+
+  if [[ -n "${legacy_stop_script}" ]]; then
+    log "stopping legacy pre-systemd deployment under ${INSTALL_PREFIX}"
+    ONE_CLICK_TOOLBOX_ROOT="${INSTALL_PREFIX}" \
+    ONE_CLICK_RUNTIME_ENV_FILE="${INSTALL_PREFIX}/.one-click.env" \
+      "${legacy_stop_script}" || true
+  fi
+}
+
+install_systemd_units() {
+  local install_units_script="${INSTALL_PREFIX}/scripts/systemd/install-units.sh"
+  ensure_file "${install_units_script}"
+  ONE_CLICK_TOOLBOX_ROOT="${INSTALL_PREFIX}" \
+  ONE_CLICK_RUNTIME_ENV_FILE="${INSTALL_PREFIX}/.one-click.env" \
+    "${install_units_script}"
+}
+
+start_systemd_target() {
+  local target
+  target="$(systemd_target_for_role "${DEPLOY_ROLE}")"
+  systemctl disable --now \
+    cube-sandbox-control.target \
+    cube-sandbox-compute.target >/dev/null 2>&1 || true
+  systemctl enable --now "${target}"
+}
+
 require_root
+
+# Run critical preflight checks that do not depend on dependency installation first
+# to ensure we fail fast before installing or modifying any local system packages.
+check_hardware_preflight
+check_pvm_consistency_preflight
+check_cubelet_fs_preflight
+check_cgroup_cpu_preflight
+check_glibc_preflight
 
 CUBE_SANDBOX_NODE_IP="$(detect_node_ip)"
 export CUBE_SANDBOX_NODE_IP
 log "using node IP: ${CUBE_SANDBOX_NODE_IP}"
+CUBE_SANDBOX_ETH_NAME="${CUBE_SANDBOX_ETH_NAME:-$(detect_primary_interface || true)}"
+if [[ -n "${CUBE_SANDBOX_ETH_NAME}" ]]; then
+  export CUBE_SANDBOX_ETH_NAME
+  log "using primary network interface: ${CUBE_SANDBOX_ETH_NAME}"
+else
+  log "primary network interface not detected; keeping packaged Cubelet eth_name"
+fi
 
-install_dependencies
-check_hardware_preflight
-check_cubelet_fs_preflight
+# Validate cubevs CIDR from env var (if set)
+CUBE_SANDBOX_NETWORK_CIDR="${CUBE_SANDBOX_NETWORK_CIDR:-}"
+if [[ -n "${CUBE_SANDBOX_NETWORK_CIDR}" ]]; then
+  check_cidr_preflight "${CUBE_SANDBOX_NETWORK_CIDR}"
+  export CUBE_SANDBOX_NETWORK_CIDR
+fi
+
+install_required_dependencies
 check_install_preflight
 if needs_docker_for_install; then
   configure_tencent_docker_mirror
@@ -255,11 +576,13 @@ WORK_DIR="$(mktemp -d)"
 trap 'rm -rf "${WORK_DIR}"' EXIT
 
 ensure_file "${PACKAGE_TAR}"
+validate_declared_release_manifest "${SCRIPT_DIR}"
 
 log "extracting package ${PACKAGE_TAR}"
 tar -xzf "${PACKAGE_TAR}" -C "${WORK_DIR}"
 PKG_ROOT="${WORK_DIR}/sandbox-package"
 ensure_dir "${PKG_ROOT}"
+validate_cubelet_cow_startup_deps "${PKG_ROOT}/Cubelet/config/config.toml"
 
 installed_role="${DEPLOY_ROLE}"
 detected_installed_role="$(detect_installed_role)"
@@ -267,18 +590,9 @@ if [[ -n "${detected_installed_role}" ]]; then
   installed_role="${detected_installed_role}"
 fi
 
-if [[ "${installed_role}" == "compute" && -x "${INSTALL_PREFIX}/scripts/one-click/down-compute.sh" ]]; then
-  stop_script="${PKG_ROOT}/scripts/one-click/down-compute.sh"
-else
-  stop_script="${PKG_ROOT}/scripts/one-click/down-with-deps.sh"
-fi
-
-if [[ -x "${stop_script}" ]]; then
-  log "stopping existing deployment under ${INSTALL_PREFIX}"
-  ONE_CLICK_TOOLBOX_ROOT="${INSTALL_PREFIX}" \
-  ONE_CLICK_RUNTIME_ENV_FILE="${INSTALL_PREFIX}/.one-click.env" \
-    "${stop_script}" || true
-fi
+log "stopping existing systemd deployment under ${INSTALL_PREFIX}"
+stop_existing_systemd_deployment
+stop_existing_legacy_deployment "${installed_role}"
 
 if [[ "${INSTALL_PREFIX%/}" == "${TOOLBOX_ROOT%/}" ]]; then
   rm -rf \
@@ -288,7 +602,9 @@ if [[ "${INSTALL_PREFIX%/}" == "${TOOLBOX_ROOT%/}" ]]; then
     "${INSTALL_PREFIX}/Cubelet" \
     "${INSTALL_PREFIX}/cubeproxy" \
     "${INSTALL_PREFIX}/coredns" \
+    "${INSTALL_PREFIX}/webui" \
     "${INSTALL_PREFIX}/support" \
+    "${INSTALL_PREFIX}/systemd" \
     "${INSTALL_PREFIX}/cube-shim" \
     "${INSTALL_PREFIX}/cube-kernel-scf" \
     "${INSTALL_PREFIX}/cube-image" \
@@ -306,10 +622,14 @@ if [[ "${DEPLOY_ROLE}" == "compute" ]]; then
   copy_dir_contents "${PKG_ROOT}/cube-shim" "${INSTALL_PREFIX}/cube-shim"
   copy_dir_contents "${PKG_ROOT}/cube-kernel-scf" "${INSTALL_PREFIX}/cube-kernel-scf"
   copy_dir_contents "${PKG_ROOT}/cube-image" "${INSTALL_PREFIX}/cube-image"
+  copy_dir_contents "${PKG_ROOT}/systemd" "${INSTALL_PREFIX}/systemd"
   copy_dir_contents "${PKG_ROOT}/scripts" "${INSTALL_PREFIX}/scripts"
 else
+  generate_cubemaster_config_ports
   cp -a "${PKG_ROOT}/." "${INSTALL_PREFIX}/"
 fi
+
+select_installed_kernel_vmlinux
 
 mkdir -p \
   "${INSTALL_PREFIX}/cube-vs/network" \
@@ -333,9 +653,28 @@ if [[ -f "${ENV_FILE}" ]]; then
 else
   : > "${RUNTIME_ENV_FILE}"
 fi
+
+# Install version files so the installed system can report its version.
+if [[ -f "${SCRIPT_DIR}/VERSION.txt" ]]; then
+  cp -f "${SCRIPT_DIR}/VERSION.txt" "${INSTALL_PREFIX}/VERSION.txt"
+  log "installed VERSION.txt to ${INSTALL_PREFIX}/VERSION.txt"
+fi
+manifest_rel="$(declared_release_manifest_relpath "${SCRIPT_DIR}/VERSION.txt")"
+if [[ -n "${manifest_rel}" ]]; then
+  cp -f "${SCRIPT_DIR}/${manifest_rel}" "${INSTALL_PREFIX}/release-manifest.json"
+  ensure_file "${INSTALL_PREFIX}/release-manifest.json"
+  log "installed ${manifest_rel} to ${INSTALL_PREFIX}/release-manifest.json"
+elif [[ -f "${SCRIPT_DIR}/release-manifest.json" ]]; then
+  cp -f "${SCRIPT_DIR}/release-manifest.json" "${INSTALL_PREFIX}/release-manifest.json"
+  log "installed release-manifest.json to ${INSTALL_PREFIX}/release-manifest.json"
+fi
 upsert_env_kv "${RUNTIME_ENV_FILE}" "ONE_CLICK_DEPLOY_ROLE" "${DEPLOY_ROLE}"
+upsert_env_kv "${RUNTIME_ENV_FILE}" "CUBE_PVM_ENABLE" "${CUBE_PVM_ENABLE}"
 if [[ -n "${CUBE_SANDBOX_NODE_IP:-}" ]]; then
   upsert_env_kv "${RUNTIME_ENV_FILE}" "CUBE_SANDBOX_NODE_IP" "${CUBE_SANDBOX_NODE_IP}"
+fi
+if [[ -n "${CUBE_SANDBOX_ETH_NAME:-}" ]]; then
+  upsert_env_kv "${RUNTIME_ENV_FILE}" "CUBE_SANDBOX_ETH_NAME" "${CUBE_SANDBOX_ETH_NAME}"
 fi
 if [[ -n "${ONE_CLICK_CONTROL_PLANE_IP:-}" ]]; then
   upsert_env_kv "${RUNTIME_ENV_FILE}" "ONE_CLICK_CONTROL_PLANE_IP" "${ONE_CLICK_CONTROL_PLANE_IP}"
@@ -344,10 +683,66 @@ if [[ -n "${ONE_CLICK_CONTROL_PLANE_CUBEMASTER_ADDR:-}" ]]; then
   upsert_env_kv "${RUNTIME_ENV_FILE}" "ONE_CLICK_CONTROL_PLANE_CUBEMASTER_ADDR" "${ONE_CLICK_CONTROL_PLANE_CUBEMASTER_ADDR}"
 fi
 
-chmod +x "${INSTALL_PREFIX}/network-agent/bin/network-agent"
+chmod +x "${INSTALL_PREFIX}/network-agent/bin/"*
 chmod +x "${INSTALL_PREFIX}/Cubelet/bin/"*
 chmod +x "${INSTALL_PREFIX}/cube-shim/bin/containerd-shim-cube-rs" "${INSTALL_PREFIX}/cube-shim/bin/cube-runtime"
 chmod +x "${INSTALL_PREFIX}/scripts/one-click/"*.sh
+chmod +x "${INSTALL_PREFIX}/scripts/systemd/"*.sh
+chmod +x "${INSTALL_PREFIX}/scripts/cube-egress/"*.sh 2>/dev/null || true
+
+if [[ -n "${CUBE_SANDBOX_ETH_NAME:-}" ]]; then
+  cubelet_config="${INSTALL_PREFIX}/Cubelet/config/config.toml"
+  if grep -Eq '^[[:space:]]*eth_name = "' "${cubelet_config}"; then
+    sed -i "s/eth_name = \"[^\"]*\"/eth_name = \"${CUBE_SANDBOX_ETH_NAME}\"/" "${cubelet_config}"
+    if ! grep -Fq "eth_name = \"${CUBE_SANDBOX_ETH_NAME}\"" "${cubelet_config}"; then
+      log "WARNING: failed to patch eth_name in Cubelet config (${cubelet_config})"
+    fi
+  else
+    log "WARNING: Cubelet config missing eth_name key; skipped NIC patch (${cubelet_config})"
+  fi
+fi
+
+# Patch cubevs CIDR if env var is set
+if [[ -n "${CUBE_SANDBOX_NETWORK_CIDR:-}" ]]; then
+  cubelet_config="${INSTALL_PREFIX}/Cubelet/config/config.toml"
+
+  # SECURITY: Refuse to patch a symlink -- sed -i follows symlinks, which
+  # could allow an attacker with write access to ONE_CLICK_INSTALL_PREFIX
+  # to overwrite arbitrary files via symlink.
+  if [[ -L "${cubelet_config}" ]]; then
+    die "refusing to patch a symlink target: ${cubelet_config} -> $(readlink "${cubelet_config}")"
+  fi
+
+  if grep -Eq '^[[:space:]]*cidr = "' "${cubelet_config}"; then
+    # NOTE: Use '|' as sed delimiter -- CIDR values always contain '/', so
+    # the default '/' delimiter would break the sed command.
+    sed -i "s|cidr = \"[^\"]*\"|cidr = \"${CUBE_SANDBOX_NETWORK_CIDR}\"|" "${cubelet_config}"
+    if ! grep -Fq "cidr = \"${CUBE_SANDBOX_NETWORK_CIDR}\"" "${cubelet_config}"; then
+      log "WARNING: failed to patch cidr in Cubelet config (${cubelet_config})"
+    fi
+    log "patched cubevs CIDR: ${CUBE_SANDBOX_NETWORK_CIDR}"
+  else
+    log "WARNING: Cubelet config missing cidr key; skipped CIDR patch (${cubelet_config})"
+  fi
+
+  # Persist CIDR to env file AFTER successful config patch (defense-in-depth:
+  # env file and config.toml should always be in sync; if the script crashes
+  # between patching and persistence, the env file stays clean).
+  if [[ -n "${CUBE_SANDBOX_NETWORK_CIDR:-}" ]]; then
+    upsert_env_kv "${RUNTIME_ENV_FILE}" "CUBE_SANDBOX_NETWORK_CIDR" "${CUBE_SANDBOX_NETWORK_CIDR}"
+  fi
+  if [[ -n "${CUBE_SANDBOX_NETWORK_CIDR_SKIP_CONFLICT_CHECK:-}" ]]; then
+    case "${CUBE_SANDBOX_NETWORK_CIDR_SKIP_CONFLICT_CHECK}" in
+      0|1) ;;
+      *) die "CUBE_SANDBOX_NETWORK_CIDR_SKIP_CONFLICT_CHECK must be 0 or 1 (got: '${CUBE_SANDBOX_NETWORK_CIDR_SKIP_CONFLICT_CHECK}')" ;;
+    esac
+    upsert_env_kv "${RUNTIME_ENV_FILE}" "CUBE_SANDBOX_NETWORK_CIDR_SKIP_CONFLICT_CHECK" "${CUBE_SANDBOX_NETWORK_CIDR_SKIP_CONFLICT_CHECK}"
+  fi
+else
+  # Log current CIDR for debugging
+  current_cidr="$(sed -nE '/^[[:space:]]*cidr[[:space:]]*=[[:space:]]*"/{s/.*"([^"]+)".*/\1/p;q;}' "${INSTALL_PREFIX}/Cubelet/config/config.toml" 2>/dev/null || echo "unknown")"
+  log "using cubevs CIDR from config.toml: ${current_cidr} (CUBE_SANDBOX_NETWORK_CIDR not set)"
+fi
 
 if [[ "${DEPLOY_ROLE}" != "compute" ]]; then
   chmod +x "${INSTALL_PREFIX}/CubeAPI/bin/cube-api"
@@ -356,16 +751,18 @@ fi
 
 ln -sf "${INSTALL_PREFIX}/cube-shim/bin/containerd-shim-cube-rs" /usr/local/bin/containerd-shim-cube-rs
 ln -sf "${INSTALL_PREFIX}/cube-shim/bin/cube-runtime" /usr/local/bin/cube-runtime
-
-if [[ "${DEPLOY_ROLE}" == "compute" ]]; then
-  start_script="${INSTALL_PREFIX}/scripts/one-click/up-compute.sh"
+ln -sf "${INSTALL_PREFIX}/Cubelet/bin/cubecli" /usr/local/bin/cubecli
+ln -sf "${INSTALL_PREFIX}/network-agent/bin/cubevsmapdump" /usr/local/bin/cubevsmapdump
+if [[ "${DEPLOY_ROLE}" != "compute" ]]; then
+  ln -sf "${INSTALL_PREFIX}/CubeMaster/bin/cubemastercli" /usr/local/bin/cubemastercli
 else
-  start_script="${INSTALL_PREFIX}/scripts/one-click/up-with-deps.sh"
+  rm -f /usr/local/bin/cubemastercli
 fi
 
-ONE_CLICK_TOOLBOX_ROOT="${INSTALL_PREFIX}" \
-ONE_CLICK_RUNTIME_ENV_FILE="${RUNTIME_ENV_FILE}" \
-  "${start_script}"
+restore_selinux_contexts
+install_systemd_units
+check_runtime_file_paths_not_directories
+start_systemd_target
 
 if [[ "${ONE_CLICK_RUN_QUICKCHECK:-1}" == "1" ]]; then
   ONE_CLICK_TOOLBOX_ROOT="${INSTALL_PREFIX}" \

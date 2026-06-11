@@ -6,7 +6,11 @@
 use crate::coredump::{
     CoredumpMemoryRegion, CoredumpMemoryRegions, DumpState, GuestDebuggableError,
 };
-use crate::migration::url_to_path;
+use crate::migration::{memory_blob_to_path, url_to_path};
+use crate::pagemap_anon::filter_memory_ranges_by_pagemap_anon;
+use crate::soft_dirty::{
+    clear_soft_dirty, filter_memory_ranges_by_anon_and_soft_dirty, probe_soft_dirty_support,
+};
 #[cfg(target_arch = "x86_64")]
 use crate::vm_config::SgxEpcConfig;
 use crate::vm_config::{HotplugMethod, MemoryConfig, MemoryZoneConfig};
@@ -34,8 +38,9 @@ use std::io::{self, Seek, SeekFrom};
 use std::ops::Deref;
 use std::os::fd::AsFd;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::result;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 use tracer::trace_scoped;
 use virtio_devices::BlocksState;
@@ -52,7 +57,7 @@ use vm_memory::{
 };
 use vm_migration::{
     protocol::MemoryRange, protocol::MemoryRangeTable, Migratable, MigratableError, Pausable,
-    Snapshot, SnapshotDataSection, Snapshottable, Transportable,
+    Snapshot, SnapshotConfig, SnapshotDataSection, SnapshotType, Snapshottable, Transportable,
 };
 
 pub const MEMORY_MANAGER_ACPI_SIZE: usize = 0x18;
@@ -60,6 +65,115 @@ pub const MEMORY_MANAGER_ACPI_SIZE: usize = 0x18;
 const DEFAULT_MEMORY_ZONE: &str = "mem0";
 
 const SNAPSHOT_FILENAME: &str = "memory-ranges";
+
+struct MemorySnapshotFile {
+    path: PathBuf,
+    external: bool,
+}
+
+impl MemorySnapshotFile {
+    fn from_snapshot_url(
+        snapshot_url: &str,
+        memory_vol_url: Option<&str>,
+    ) -> result::Result<Self, MigratableError> {
+        if let Some(memory_vol_url) = memory_vol_url {
+            Ok(Self {
+                path: memory_blob_to_path(memory_vol_url)?,
+                external: true,
+            })
+        } else {
+            let mut path = url_to_path(snapshot_url)?;
+            path.push(SNAPSHOT_FILENAME);
+            Ok(Self {
+                path,
+                external: false,
+            })
+        }
+    }
+
+    fn open_read(&self) -> io::Result<File> {
+        OpenOptions::new().read(true).open(&self.path)
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn is_external(&self) -> bool {
+        self.external
+    }
+
+    fn open_read_write(&self) -> result::Result<File, MigratableError> {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&self.path)
+            .map_err(|e| MigratableError::MigrateSend(e.into()))
+    }
+
+    fn open_for_fresh_write(&self) -> result::Result<File, MigratableError> {
+        if self.external {
+            return self.open_read_write();
+        }
+
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .truncate(true)
+            .open(&self.path)
+            .map_err(|e| MigratableError::MigrateSend(e.into()))
+    }
+}
+
+#[cfg(test)]
+mod memory_snapshot_file_tests {
+    use super::{MemorySnapshotFile, SNAPSHOT_FILENAME};
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_temp_path(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("ch-memory-snapshot-{}-{}", name, nanos))
+    }
+
+    #[test]
+    fn default_snapshot_target_uses_memory_ranges_file() {
+        let dir_path = unique_temp_path("dir");
+        fs::create_dir_all(&dir_path).unwrap();
+        let snapshot_url = format!("file://{}", dir_path.display());
+
+        let target = MemorySnapshotFile::from_snapshot_url(&snapshot_url, None).unwrap();
+        assert!(!target.external);
+        assert_eq!(target.path, dir_path.join(SNAPSHOT_FILENAME));
+        target.open_for_fresh_write().unwrap();
+        assert!(target.path.exists());
+
+        fs::remove_dir_all(dir_path).unwrap();
+    }
+
+    #[test]
+    fn external_snapshot_target_keeps_existing_file_intact() {
+        let file_path = unique_temp_path("external");
+        fs::write(&file_path, b"existing-memory").unwrap();
+        let original_len = fs::metadata(&file_path).unwrap().len();
+
+        let target = MemorySnapshotFile::from_snapshot_url(
+            "file:///unused",
+            Some(file_path.to_str().unwrap()),
+        )
+        .unwrap();
+        assert!(target.external);
+        target.open_for_fresh_write().unwrap();
+
+        assert_eq!(fs::metadata(&file_path).unwrap().len(), original_len);
+        fs::remove_file(file_path).unwrap();
+    }
+}
 
 #[cfg(target_arch = "x86_64")]
 const X86_64_IRQ_BASE: u32 = 5;
@@ -158,6 +272,13 @@ struct ArchMemRegion {
 pub struct MemoryManager {
     boot_guest_memory: GuestMemoryMmap,
     guest_memory: GuestMemoryAtomic<GuestMemoryMmap>,
+    // device_memory is a superset of guest_memory: it contains all RAM regions
+    // plus device-backed regions (e.g. virtio-pmem, virtio-fs DAX window,
+    // ivshmem). Use this view for any virtio backend that may need to
+    // dereference a GPA pointing into device-mapped host memory; use
+    // guest_memory for snapshot, migration, coredump and firmware-loading
+    // paths.
+    device_memory: GuestMemoryAtomic<GuestMemoryMmap>,
     next_memory_slot: u32,
     start_of_device_area: GuestAddress,
     end_of_device_area: GuestAddress,
@@ -180,6 +301,11 @@ pub struct MemoryManager {
     sgx_epc_region: Option<SgxEpcRegion>,
     user_provided_zones: bool,
     snapshot_memory_ranges: MemoryRangeTable,
+    /// Whether the soft-dirty tracker is currently armed (i.e. the previous
+    /// snapshot cycle ended with a successful `clear_soft_dirty()`, so the
+    /// pagemap bit-55 set this cycle reflects only writes that happened
+    /// since then).
+    soft_dirty_armed: AtomicBool,
     memory_zones: MemoryZones,
     log_dirty: bool, // Enable dirty logging for created RAM regions
     arch_mem_regions: Vec<ArchMemRegion>,
@@ -1080,6 +1206,13 @@ impl MemoryManager {
         };
 
         let guest_memory = GuestMemoryAtomic::new(guest_memory);
+        // device_memory starts as an independent container holding the same
+        // RAM regions as guest_memory. Region Arcs are shared (no extra mmap),
+        // but the two containers evolve independently afterwards: RAM changes
+        // are double-written via add_region(), while device-backed regions
+        // (PMEM/SHM/...) are inserted into device_memory only via
+        // add_device_region().
+        let device_memory = GuestMemoryAtomic::new(guest_memory.memory().deref().clone());
 
         // Both MMIO and PIO address spaces start at address 0.
         let allocator = Arc::new(Mutex::new(
@@ -1133,6 +1266,7 @@ impl MemoryManager {
         let mut memory_manager = MemoryManager {
             boot_guest_memory,
             guest_memory,
+            device_memory,
             next_memory_slot,
             start_of_device_area,
             end_of_device_area,
@@ -1154,6 +1288,7 @@ impl MemoryManager {
             sgx_epc_region: None,
             user_provided_zones,
             snapshot_memory_ranges: MemoryRangeTable::default(),
+            soft_dirty_armed: AtomicBool::new(false),
             memory_zones,
             guest_ram_mappings: Vec::new(),
             acpi_address,
@@ -1189,18 +1324,19 @@ impl MemoryManager {
         source_url: Option<&str>,
         prefault: bool,
         phys_bits: u8,
+        memory_vol_url: Option<&str>,
     ) -> Result<Arc<Mutex<MemoryManager>>, Error> {
         if let Some(source_url) = source_url {
-            let mut memory_file_path = url_to_path(source_url).map_err(Error::Restore)?;
-            memory_file_path.push(String::from(SNAPSHOT_FILENAME));
+            let memory_file_target =
+                MemorySnapshotFile::from_snapshot_url(source_url, memory_vol_url)
+                    .map_err(Error::Restore)?;
 
             let fast_restore = Self::support_fast_restore_check(config);
             let memory_file = if fast_restore {
                 info!("restore non-shared map, speed up restore by share map memory file");
                 Some(
-                    OpenOptions::new()
-                        .read(true)
-                        .open(memory_file_path.clone())
+                    memory_file_target
+                        .open_read()
                         .map_err(Error::SnapshotOpen)?,
                 )
             } else {
@@ -1229,7 +1365,7 @@ impl MemoryManager {
                 info!("restore shared map, fall back to slow restore");
                 mm.lock()
                     .unwrap()
-                    .fill_saved_regions(memory_file_path, mem_snapshot.memory_ranges)?;
+                    .fill_saved_regions(memory_file_target.path, mem_snapshot.memory_ranges)?;
             }
 
             Ok(mm)
@@ -1454,14 +1590,72 @@ impl MemoryManager {
     }
 
     // Update the GuestMemoryMmap with the new range
+    //
+    // RAM changes must be double-written: first into device_memory so any
+    // virtio backend activation immediately sees the new region, then into
+    // guest_memory (the RAM-only view used by snapshot/coredump/migration).
+    // The two containers are independent (see constructor); region Arcs are
+    // shared, so this only clones a small Vec and bumps refcounts.
     fn add_region(&mut self, region: Arc<GuestRegionMmap>) -> Result<(), Error> {
-        let guest_memory = self
+        // 1) Update device_memory first.
+        let new_device_memory = self
+            .device_memory
+            .memory()
+            .insert_region(Arc::clone(&region))
+            .map_err(Error::GuestMemory)?;
+        self.device_memory
+            .lock()
+            .unwrap()
+            .replace(new_device_memory);
+
+        // 2) Update guest_memory (RAM view).
+        let new_guest_memory = self
             .guest_memory
             .memory()
             .insert_region(region)
             .map_err(Error::GuestMemory)?;
-        self.guest_memory.lock().unwrap().replace(guest_memory);
+        self.guest_memory.lock().unwrap().replace(new_guest_memory);
 
+        Ok(())
+    }
+
+    /// Insert a device-backed region (e.g. virtio-pmem, virtio-fs DAX
+    /// window, ivshmem) into the device_memory view ONLY. The region will
+    /// NOT be visible through guest_memory(), so it does not affect
+    /// snapshot, migration, coredump, or firmware-loading paths.
+    pub fn add_device_region(&mut self, region: Arc<GuestRegionMmap>) -> Result<(), Error> {
+        let new_device_memory = self
+            .device_memory
+            .memory()
+            .insert_region(region)
+            .map_err(Error::GuestMemory)?;
+        self.device_memory
+            .lock()
+            .unwrap()
+            .replace(new_device_memory);
+        Ok(())
+    }
+
+    /// Remove a previously inserted device-backed region from device_memory.
+    /// `start_addr`/`size` must match the region exactly (vm-memory requires
+    /// an exact-size match, otherwise it returns `InvalidGuestRegion`).
+    /// Use this in the unmap path of dynamically-mapped device segments
+    /// (e.g. ivshmem unmap_region) so device_memory does not retain a dead
+    /// reference to a region whose KVM slot has just been removed.
+    pub fn remove_device_region(
+        &mut self,
+        start_addr: GuestAddress,
+        size: GuestUsize,
+    ) -> Result<(), Error> {
+        let (new_device_memory, _removed) = self
+            .device_memory
+            .memory()
+            .remove_region(start_addr, size)
+            .map_err(Error::GuestMemory)?;
+        self.device_memory
+            .lock()
+            .unwrap()
+            .replace(new_device_memory);
         Ok(())
     }
 
@@ -1581,6 +1775,13 @@ impl MemoryManager {
 
     pub fn guest_memory(&self) -> GuestMemoryAtomic<GuestMemoryMmap> {
         self.guest_memory.clone()
+    }
+
+    /// Return the device-memory view: RAM + device-backed regions.
+    /// Use this for any virtio/DMA backend that may need to access GPAs
+    /// pointing into device-mapped host memory (e.g. PMEM).
+    pub fn device_memory(&self) -> GuestMemoryAtomic<GuestMemoryMmap> {
+        self.device_memory.clone()
     }
 
     pub fn boot_guest_memory(&self) -> GuestMemoryMmap {
@@ -2157,6 +2358,272 @@ impl MemoryManager {
 
         Ok(())
     }
+
+    /// Save a pagemap_anon incremental snapshot.
+    ///
+    /// This method creates a full snapshot by merging the base snapshot with
+    /// pagemap_anon-filtered anonymous pages (CoW pages) from current VM memory.
+    /// Only pages that Guest actually wrote to (triggering Copy-on-Write from
+    /// the MAP_PRIVATE mmap) are saved from guest memory; non-anonymous pages
+    /// When a base snapshot exists at the destination, the file is opened in
+    /// read-write mode and only the anonymous (CoW) pages are overwritten;
+    /// non-anonymous regions keep their original content from the base.
+    ///
+    /// When no base snapshot exists (cold start), a new file is created and
+    /// only anonymous pages are written; non-anonymous regions are left as
+    /// holes (zeros) in the pre-allocated file.
+    ///
+    /// The resulting snapshot file is in the same format as a regular full
+    /// snapshot and can be restored without any special handling.
+    fn send_pagemap_anon_memory(
+        &self,
+        destination_url: &str,
+        memory_vol_url: &Option<String>,
+    ) -> result::Result<(), MigratableError> {
+        if self.snapshot_memory_ranges.is_empty() {
+            return Ok(());
+        }
+
+        let guest_memory = self.guest_memory.memory();
+
+        // Use pagemap + kpageflags to filter memory ranges, keeping only anonymous pages (CoW)
+        let (filtered_ranges, stats) =
+            filter_memory_ranges_by_pagemap_anon(&guest_memory, &self.snapshot_memory_ranges)
+                .map_err(|e| {
+                    MigratableError::MigrateSend(anyhow!(
+                        "Failed to filter memory with pagemap_anon: {}",
+                        e
+                    ))
+                })?;
+
+        info!(
+            "PagemapAnon snapshot: total={} bytes ({} pages), anon={} bytes ({} pages), savings={:.1}%",
+            stats.total_bytes,
+            stats.total_pages,
+            stats.saved_bytes,
+            stats.anon_pages,
+            stats.savings_percentage()
+        );
+
+        let memory_file_target =
+            MemorySnapshotFile::from_snapshot_url(destination_url, memory_vol_url.as_deref())?;
+        if !memory_file_target.path().exists() {
+            return Err(MigratableError::MigrateSend(anyhow!(
+                "Base snapshot file not found at {:?}, incremental (pagemap_anon) snapshot requires an existing base file",
+                memory_file_target.path()
+            )));
+        }
+
+        info!(
+            "Base snapshot found at {:?}, overwriting anonymous pages in-place",
+            memory_file_target.path()
+        );
+        let memory_file = memory_file_target.open_read_write()?;
+
+        // Build a GPA-to-file-offset mapping for calculating offsets.
+        let mut gpa_to_file_offset: Vec<(u64, u64, u64)> = Vec::new();
+        let mut offset = 0_u64;
+        for range in self.snapshot_memory_ranges.regions() {
+            gpa_to_file_offset.push((range.gpa, range.length, offset));
+            offset += range.length;
+        }
+
+        // Write only anonymous pages to the snapshot file.
+        // With a base, non-anon regions already have the correct content.
+        // Without a base, non-anon regions are zeros (sparse holes).
+        for range in filtered_ranges.regions() {
+            let file_off =
+                Self::calculate_file_offset_for_gpa(range.gpa, range.length, &gpa_to_file_offset)?;
+            self.save_range_to_file(&memory_file, range, file_off)?;
+        }
+
+        info!(
+            "PagemapAnon snapshot saved: {} anon bytes written to {:?}",
+            stats.saved_bytes,
+            memory_file_target.path()
+        );
+        Ok(())
+    }
+
+    /// Save a soft-dirty incremental snapshot.
+    ///
+    /// This method writes a delta snapshot containing only the pages that
+    /// must change in the destination snapshot file. We compute that set as
+    /// the **intersection** of:
+    ///   * pagemap_anon (Copy-on-Written pages — only these can ever differ
+    ///     from the base snapshot file the guest was restored from), and
+    ///   * `/proc/self/pagemap` bit 55 (pages written since the previous
+    ///     `clear_soft_dirty()`).
+    ///
+    /// To remain compatible with the rest of the VMM (snapshot consumers
+    /// expect a self-contained, full-size memory image at the destination),
+    /// the resulting file is **not** a raw delta. We prepare a base image
+    /// at the destination and then overwrite only the filtered pages on
+    /// top.
+    ///
+    /// Lazy probe / arm:
+    /// Soft-dirty tracking is **not** probed nor armed at boot or restore
+    /// time anymore — `clear_refs(4)` walks every PTE under mmap_lock and
+    /// is the dominant pause-time cost on multi-GiB guests. Instead, the
+    /// very first call to this method:
+    ///   1. Tries `probe_soft_dirty_support()` (which itself performs the
+    ///      initial `clear_soft_dirty()` and arms tracking on success).
+    ///   2. Writes a snapshot using the pagemap_anon set (every CoW page),
+    ///      because there is no prior soft-dirty window to take an
+    ///      intersection against.
+    ///   3. Sets `soft_dirty_armed = true` only on probe success.
+    ///
+    /// Subsequent calls (with `soft_dirty_armed == true`) take the
+    /// anon ∩ soft-dirty intersection, write only the changed CoW pages,
+    /// and re-arm via `clear_soft_dirty()` for the next cycle.
+    ///
+    /// Degradation: if `probe_soft_dirty_support()` returns false (kernel
+    /// without `CONFIG_MEM_SOFT_DIRTY=y`), or any `clear_soft_dirty()`
+    /// call fails at runtime, this method silently falls back to the
+    /// pagemap_anon path and leaves `soft_dirty_armed` at false so the
+    /// next cycle retries. The fallback is logged but not surfaced as
+    /// an error to the caller.
+    fn send_soft_dirty_memory(
+        &self,
+        destination_url: &str,
+        memory_vol_url: &Option<String>,
+    ) -> result::Result<(), MigratableError> {
+        if self.snapshot_memory_ranges.is_empty() {
+            return Ok(());
+        }
+
+        // First-time path (or any time we are not currently armed): we
+        // cannot trust the soft-dirty bitmap because there is no prior
+        // `clear_soft_dirty()` to anchor the window, so write the full
+        // anon-page set. Then try to arm tracking for the next cycle.
+        if !self.soft_dirty_armed.load(Ordering::Acquire) {
+            info!(
+                "Soft-dirty: tracker not yet armed, writing full anon-page snapshot \
+                 and attempting to arm soft-dirty for the next cycle"
+            );
+
+            // Write a full anon-page (pagemap_anon) snapshot. This already
+            // matches what `send_pagemap_anon_memory` does and it produces
+            // a self-contained snapshot file.
+            self.send_pagemap_anon_memory(destination_url, memory_vol_url)?;
+
+            // Probe + arm. `probe_soft_dirty_support()` writes "4" to
+            // /proc/self/clear_refs, which both detects kernel support
+            // (returns false on EINVAL when CONFIG_MEM_SOFT_DIRTY=n) and,
+            // on success, clears every PTE's bit 55 — which is exactly
+            // the "arm" operation for the next snapshot window.
+            if probe_soft_dirty_support() {
+                self.soft_dirty_armed.store(true, Ordering::Release);
+                info!("Soft-dirty: tracker armed for next snapshot cycle");
+            } else {
+                debug!(
+                    "Soft-dirty: kernel does not support CONFIG_MEM_SOFT_DIRTY, \
+                     subsequent snapshots will keep using the anon-page path"
+                );
+            }
+
+            return Ok(());
+        }
+
+        // Steady-state path: the tracker has been armed by a previous
+        // call, so pagemap bit 55 reflects only writes that happened in
+        // this window. Filter pages by anon ∩ soft-dirty to get the
+        // minimal set that has actually changed since the last snapshot.
+        let memory_file_target =
+            MemorySnapshotFile::from_snapshot_url(destination_url, memory_vol_url.as_deref())?;
+
+        let guest_memory = self.guest_memory.memory();
+        let (filtered_ranges, stats) = filter_memory_ranges_by_anon_and_soft_dirty(
+            &guest_memory,
+            &self.snapshot_memory_ranges,
+        )
+        .map_err(|e| {
+            MigratableError::MigrateSend(anyhow!(
+                "Failed to filter memory with anon ∩ soft-dirty: {}",
+                e
+            ))
+        })?;
+
+        info!(
+            "Soft-dirty snapshot (anon ∩ soft-dirty): total={} bytes ({} pages), \
+             dirty={} bytes ({} pages), savings={:.1}%",
+            stats.total_bytes,
+            stats.total_pages,
+            stats.saved_bytes,
+            stats.dirty_pages,
+            stats.savings_percentage()
+        );
+
+        // Prepare the destination file. The previous snapshot already
+        // contains every still-clean page; we just overlay the changed
+        // ones in place. The base file is mandatory here: if it doesn't
+        // exist, a soft-dirty (delta) snapshot is meaningless because
+        // there is no full image to overlay onto. Refuse the request and
+        // let the caller take a Full snapshot first.
+        if !memory_file_target.path().exists() {
+            return Err(MigratableError::MigrateSend(anyhow!(
+                "Base snapshot file not found at {:?}, soft-dirty snapshot requires \
+                 an existing base file; take a full snapshot first",
+                memory_file_target.path()
+            )));
+        }
+        let memory_file = memory_file_target.open_read_write()?;
+
+        // Build a GPA-to-file-offset mapping for calculating offsets.
+        let mut gpa_to_file_offset: Vec<(u64, u64, u64)> = Vec::new();
+        let mut offset = 0_u64;
+        for range in self.snapshot_memory_ranges.regions() {
+            gpa_to_file_offset.push((range.gpa, range.length, offset));
+            offset += range.length;
+        }
+
+        // Overlay only the filtered (anon ∩ soft-dirty) pages.
+        for range in filtered_ranges.regions() {
+            let file_off =
+                Self::calculate_file_offset_for_gpa(range.gpa, range.length, &gpa_to_file_offset)?;
+            self.save_range_to_file(&memory_file, range, file_off)?;
+        }
+        info!(
+            "Soft-dirty snapshot saved: {} dirty bytes written to {:?}",
+            stats.saved_bytes,
+            memory_file_target.path()
+        );
+
+        // Re-arm tracking for the next cycle.
+        if let Err(e) = clear_soft_dirty() {
+            warn!(
+                "Soft-dirty: clear_soft_dirty() failed after writing delta ({}), \
+                 disarming; the next snapshot will fall back to the full \
+                 anon-page path and try to re-arm",
+                e
+            );
+            self.soft_dirty_armed.store(false, Ordering::Release);
+        }
+
+        Ok(())
+    }
+
+    /// Calculate the file offset for a given GPA within the snapshot file.
+    ///
+    /// The snapshot file stores memory regions sequentially. This method finds
+    /// which region contains the given GPA and computes the corresponding
+    /// file offset.
+    fn calculate_file_offset_for_gpa(
+        gpa: u64,
+        length: u64,
+        gpa_to_file_offset: &[(u64, u64, u64)],
+    ) -> result::Result<u64, MigratableError> {
+        for &(region_gpa, region_length, file_offset) in gpa_to_file_offset {
+            if gpa >= region_gpa && gpa + length <= region_gpa + region_length {
+                return Ok(file_offset + (gpa - region_gpa));
+            }
+        }
+        Err(MigratableError::MigrateSend(anyhow!(
+            "Could not find file offset for GPA 0x{:x} (length {})",
+            gpa,
+            length
+        )))
+    }
 }
 
 struct MemoryNotify {
@@ -2548,32 +3015,28 @@ impl Transportable for MemoryManager {
     fn send(
         &self,
         _snapshot: &Snapshot,
-        destination_url: &str,
+        config: &SnapshotConfig,
     ) -> result::Result<(), MigratableError> {
         if self.snapshot_memory_ranges.is_empty() {
             return Ok(());
         }
 
-        let mut memory_file_path = url_to_path(destination_url)?;
-        memory_file_path.push(String::from(SNAPSHOT_FILENAME));
-
-        // Create the snapshot file for the entire memory
-        let memory_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .truncate(true)
-            .open(memory_file_path)
-            .map_err(|e| MigratableError::MigrateSend(e.into()))?;
-
-        let guest_memory = self.guest_memory.memory();
+        let destination_url = &config.destination_url;
+        let memory_file_target = MemorySnapshotFile::from_snapshot_url(
+            destination_url,
+            config.memory_vol_url.as_deref(),
+        )?;
 
         if self.dirty_log {
+            let guest_memory = self.guest_memory.memory();
+            let memory_file = memory_file_target.open_for_fresh_write()?;
             info!("Saving dirty guest memory to snapshot image file.");
             let total_size = guest_memory.iter().map(|region| region.len()).sum::<u64>();
-            memory_file
-                .set_len(total_size)
-                .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+            if !memory_file_target.is_external() {
+                memory_file
+                    .set_len(total_size)
+                    .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+            }
 
             let mut offset = 0_u64;
             for range in self.snapshot_memory_ranges.regions() {
@@ -2633,27 +3096,27 @@ impl Transportable for MemoryManager {
                 // Move to next range.
                 offset += range.length;
             }
-
-            // Ensure all dirty memory data is flushed to disk for cross-machine
-            // pause-snapshot scenarios.
-            memory_file
-                .sync_all()
-                .map_err(|e| MigratableError::MigrateSend(e.into()))?;
-
             return Ok(());
         }
 
-        info!("Saving full guest memory to snapshot image file.");
-        for range in self.snapshot_memory_ranges.regions() {
-            self.save_range_to_file(&memory_file, range, 0)?;
+        match config.snapshot_type {
+            SnapshotType::Incremental => {
+                self.send_pagemap_anon_memory(destination_url, &config.memory_vol_url)?;
+            }
+            SnapshotType::SoftDirty => {
+                self.send_soft_dirty_memory(destination_url, &config.memory_vol_url)?;
+            }
+            SnapshotType::Full => {
+                let memory_file = memory_file_target.open_for_fresh_write()?;
+
+                info!("Saving full guest memory to snapshot image file.");
+                let mut file_offset = 0u64;
+                for range in self.snapshot_memory_ranges.regions() {
+                    self.save_range_to_file(&memory_file, range, file_offset)?;
+                    file_offset += range.length;
+                }
+            }
         }
-
-        // Ensure all memory data is flushed to disk for cross-machine
-        // pause-snapshot scenarios.
-        memory_file
-            .sync_all()
-            .map_err(|e| MigratableError::MigrateSend(e.into()))?;
-
         Ok(())
     }
 }

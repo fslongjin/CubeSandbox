@@ -13,16 +13,27 @@ fi
 
 WORK_ROOT="${ONE_CLICK_WORK_ROOT:-${SCRIPT_DIR}/.work}"
 RUNTIME_LAYOUT_DIR="${ONE_CLICK_RUNTIME_LAYOUT_DIR:-${WORK_ROOT}/runtime-layout}"
+
+LATEST_RELEASE_TAG="$(git -C "${ROOT_DIR}" describe --tags --abbrev=0 --match 'v*' 2>/dev/null || true)"
+
+# Version injection for Rust build.rs (shim, cube-runtime) when built on host.
+# In CI these are prebuilt via the builder container; for local dev, provide
+# consistent fallbacks so all components share the same version information.
+: "${CUBE_VERSION:=${LATEST_RELEASE_TAG:-0.0.0-dev}}"
+: "${CUBE_COMMIT:=$(git -C "${ROOT_DIR}" rev-parse HEAD 2>/dev/null || echo 'unknown')}"
+: "${CUBE_BUILD_TIME:=$(date -u +'%Y-%m-%dT%H:%M:%SZ')}"
+export CUBE_VERSION CUBE_COMMIT CUBE_BUILD_TIME
 GUEST_IMAGE_WORK_DIR="${WORK_ROOT}/guest-image-build"
 GUEST_ROOTFS_DIR="${GUEST_IMAGE_WORK_DIR}/rootfs"
 GUEST_ROOTFS_TAR="${GUEST_IMAGE_WORK_DIR}/rootfs.tar"
 RAW_ARTIFACTS_DIR="${SCRIPT_DIR}/assets/kernel-artifacts"
 
 CUBE_KERNEL_VMLINUX="${ONE_CLICK_CUBE_KERNEL_VMLINUX:-${RAW_ARTIFACTS_DIR}/vmlinux}"
+CUBE_KERNEL_PVM_VMLINUX="${ONE_CLICK_CUBE_KERNEL_PVM_VMLINUX:-${RAW_ARTIFACTS_DIR}/vmlinux-pvm}"
 GUEST_IMAGE_DOCKERFILE="${ONE_CLICK_GUEST_IMAGE_DOCKERFILE:-${ROOT_DIR}/deploy/guest-image/Dockerfile}"
 GUEST_IMAGE_CONTEXT_DIR="${ONE_CLICK_GUEST_IMAGE_CONTEXT_DIR:-$(dirname "${GUEST_IMAGE_DOCKERFILE}")}"
 GUEST_IMAGE_REF="${ONE_CLICK_GUEST_IMAGE_REF:-cube-sandbox-guest-image:one-click}"
-GUEST_IMAGE_VERSION="${ONE_CLICK_GUEST_IMAGE_VERSION:-$(latest_git_revision "${ROOT_DIR}")}"
+GUEST_IMAGE_VERSION="${ONE_CLICK_GUEST_IMAGE_VERSION:-${CUBE_VERSION:-${LATEST_RELEASE_TAG:-$(latest_git_revision "${ROOT_DIR}")}}}"
 
 CUBE_AGENT_BUILD_MODE="${ONE_CLICK_CUBE_AGENT_BUILD_MODE:-local}"
 CUBE_SHIM_BUILD_MODE="${ONE_CLICK_CUBE_SHIM_BUILD_MODE:-local}"
@@ -240,6 +251,112 @@ run_mkfs_ext4_with_optional_sudo() {
   sudo mkfs.ext4 "$@"
 }
 
+run_as_root() {
+  if [[ "${EUID}" -eq 0 ]]; then
+    "$@"
+    return $?
+  fi
+
+  # Try without sudo first so command substitution still captures stdout.
+  if "$@" 2>/dev/null; then
+    return 0
+  fi
+
+  require_cmd sudo
+  sudo "$@"
+}
+
+# Locale-stable dumpe2fs wrapper: dumpe2fs translates field names under
+# non-C locales, which would break the awk parsing in shrink_ext4_image.
+dump_ext4_header() {
+  local img="$1"
+  if [[ "${EUID}" -eq 0 ]]; then
+    LC_ALL=C dumpe2fs -h "${img}" 2>/dev/null
+    return $?
+  fi
+
+  if LC_ALL=C dumpe2fs -h "${img}" 2>/dev/null; then
+    return 0
+  fi
+
+  require_cmd sudo
+  sudo LC_ALL=C dumpe2fs -h "${img}" 2>/dev/null
+}
+
+SHRINK_RESERVED_BYTES="${ONE_CLICK_GUEST_IMAGE_RESERVED_BYTES:-$((32 * 1024 * 1024))}"
+
+# The cube hypervisor exposes the guest image as a pmem device, and the device
+# manager rejects pmem regions whose size is not a multiple of 2 MiB (matches
+# the guest hugepage granularity, see hypervisor/vmm/src/device_manager.rs:
+# `if size % 0x20_0000 != 0 { Err(PmemSizeNotAligned) }`). The shrink path
+# below must therefore round the final image size *up* to a 2 MiB boundary
+# instead of stopping at ext4's natural block alignment (4 KiB), otherwise
+# template launch fails with PmemSizeNotAligned.
+PMEM_ALIGN_BYTES=$((2 * 1024 * 1024))
+
+# Shrink the ext4 image to its minimum size, then grow it by RESERVED bytes of
+# free headroom so the guest still has room for runtime writes.
+shrink_ext4_image() {
+  local img="$1"
+  local reserved_bytes="${2:-${SHRINK_RESERVED_BYTES}}"
+  local dumpe2fs_out block_size min_blocks reserved_blocks target_blocks final_bytes min_bytes
+  local pmem_align_blocks
+
+  run_as_root e2fsck -fy "${img}" >&2 || true
+  run_as_root resize2fs -M "${img}" >&2
+
+  dumpe2fs_out="$(dump_ext4_header "${img}")"
+  block_size="$(printf '%s\n' "${dumpe2fs_out}" | awk -F': *' '/^Block size/ {print $2; exit}')"
+  min_blocks="$(printf '%s\n' "${dumpe2fs_out}" | awk -F': *' '/^Block count/ {print $2; exit}')"
+
+  if [[ -z "${block_size}" || -z "${min_blocks}" ]]; then
+    die "failed to parse ext4 metadata from ${img}"
+  fi
+
+  # ext4 block sizes are always a power of two (1/2/4 KiB), so 2 MiB is an
+  # exact multiple of every legal block size. Verify defensively so a future
+  # exotic block size produces a clear error instead of a subtly misaligned
+  # image that only fails inside the VMM.
+  if (( PMEM_ALIGN_BYTES % block_size != 0 )); then
+    die "pmem alignment ${PMEM_ALIGN_BYTES} not a multiple of ext4 block size ${block_size}"
+  fi
+  pmem_align_blocks="$(( PMEM_ALIGN_BYTES / block_size ))"
+
+  reserved_blocks="$(( (reserved_bytes + block_size - 1) / block_size ))"
+  target_blocks="$(( min_blocks + reserved_blocks ))"
+  # Round target_blocks UP to the pmem alignment so the resulting image size
+  # (target_blocks * block_size) is a multiple of 2 MiB. Rounding up only ever
+  # grows the headroom (worst case <2 MiB extra), so it cannot truncate live
+  # filesystem data.
+  target_blocks="$(( ((target_blocks + pmem_align_blocks - 1) / pmem_align_blocks) * pmem_align_blocks ))"
+  final_bytes="$(( target_blocks * block_size ))"
+  min_bytes="$(( min_blocks * block_size ))"
+
+  # Defensive sanity check: truncating below the shrunk filesystem size would
+  # chop live FS data. With reserved_blocks >= 0 this should never trigger,
+  # but we want a clear failure if future refactors break the invariant.
+  if (( final_bytes < min_bytes )); then
+    die "shrink target ${final_bytes} smaller than ext4 minimum ${min_bytes}"
+  fi
+  if (( final_bytes % PMEM_ALIGN_BYTES != 0 )); then
+    die "shrink target ${final_bytes} not aligned to pmem boundary ${PMEM_ALIGN_BYTES}"
+  fi
+
+  # The resulting ext4 file is sparse: ext4 free space inside the image
+  # corresponds to filesystem holes on the host. Packagers that don't
+  # preserve sparseness (e.g. plain tar without --sparse) will inflate
+  # the file back to its apparent size, but gzip still compresses the
+  # zeroed extents efficiently.
+  run_as_root truncate -s "${final_bytes}" "${img}"
+  run_as_root resize2fs "${img}" "${target_blocks}" >&2
+  run_as_root e2fsck -fy "${img}" >&2 || true
+
+  local human_final human_reserved
+  human_final="$(numfmt --to=iec --suffix=B "${final_bytes}" 2>/dev/null || echo "${final_bytes}")"
+  human_reserved="$(numfmt --to=iec --suffix=B "${reserved_bytes}" 2>/dev/null || echo "${reserved_bytes}")"
+  log "guest image shrunk to ${human_final} (reserved ${human_reserved} headroom, 2MiB pmem aligned)"
+}
+
 remove_path_with_optional_sudo() {
   if [[ "$#" -eq 0 ]]; then
     return 0
@@ -326,6 +443,7 @@ EOF
 build_guest_image_artifacts() {
   local output_img="$1"
   local output_version="$2"
+  local output_agent_version="$3"
   local rootfs_size_bytes
   local image_size_bytes
   local guest_container_id=""
@@ -333,7 +451,7 @@ build_guest_image_artifacts() {
   ensure_dir "${GUEST_IMAGE_CONTEXT_DIR}"
   ensure_file "${GUEST_IMAGE_DOCKERFILE}"
 
-  mkdir -p "${GUEST_IMAGE_WORK_DIR}" "$(dirname "${output_img}")" "$(dirname "${output_version}")"
+  mkdir -p "${GUEST_IMAGE_WORK_DIR}" "$(dirname "${output_img}")" "$(dirname "${output_version}")" "$(dirname "${output_agent_version}")"
   remove_path_with_optional_sudo "${GUEST_ROOTFS_DIR}" "${GUEST_ROOTFS_TAR}"
 
   log "building guest image from ${GUEST_IMAGE_DOCKERFILE}"
@@ -353,9 +471,14 @@ build_guest_image_artifacts() {
   image_size_bytes="$(calculate_guest_image_size_bytes "${rootfs_size_bytes}")"
 
   truncate -s "${image_size_bytes}" "${output_img}"
-  run_mkfs_ext4_with_optional_sudo -F -d "${GUEST_ROOTFS_DIR}" "${output_img}" >&2
+  # Force 4K block size: CubeShim boots the kernel with rootflags=dax, which
+  # does not support 1K block sizes and would panic at boot time.
+  run_mkfs_ext4_with_optional_sudo -F -b 4096 -d "${GUEST_ROOTFS_DIR}" "${output_img}" >&2
+
+  shrink_ext4_image "${output_img}"
 
   printf '%s\n' "${GUEST_IMAGE_VERSION}" > "${output_version}"
+  printf '%s\n' "${CUBE_VERSION}" > "${output_agent_version}"
 
   docker rm -f "${guest_container_id}" >/dev/null 2>&1 || true
   guest_container_id=""
@@ -367,6 +490,9 @@ require_cmd python3
 require_cmd truncate
 require_cmd ldd
 require_cmd mkfs.ext4
+require_cmd e2fsck
+require_cmd resize2fs
+require_cmd dumpe2fs
 require_cmd docker
 require_cmd tar
 
@@ -393,9 +519,20 @@ prepare_runtime_config "${RUNTIME_LAYOUT_DIR}/cube-shim/conf/config-cube.toml"
 log "building guest image artifacts"
 build_guest_image_artifacts \
   "${RUNTIME_LAYOUT_DIR}/cube-image/cube-guest-image-cpu.img" \
-  "${RUNTIME_LAYOUT_DIR}/cube-image/version"
-log "copying fixed kernel vmlinux"
-copy_file "${CUBE_KERNEL_VMLINUX}" "${RUNTIME_LAYOUT_DIR}/cube-kernel-scf/vmlinux"
-ensure_file "${RUNTIME_LAYOUT_DIR}/cube-kernel-scf/vmlinux"
+  "${RUNTIME_LAYOUT_DIR}/cube-image/version" \
+  "${RUNTIME_LAYOUT_DIR}/cube-image/agent-version"
+log "copying ordinary guest kernel vmlinux"
+copy_file "${CUBE_KERNEL_VMLINUX}" "${RUNTIME_LAYOUT_DIR}/cube-kernel-scf/vmlinux-bm"
+ensure_file "${RUNTIME_LAYOUT_DIR}/cube-kernel-scf/vmlinux-bm"
+ln -sfn "vmlinux-bm" "${RUNTIME_LAYOUT_DIR}/cube-kernel-scf/vmlinux"
+if [[ -f "${CUBE_KERNEL_PVM_VMLINUX}" ]]; then
+  log "copying PVM kernel vmlinux"
+  copy_file "${CUBE_KERNEL_PVM_VMLINUX}" "${RUNTIME_LAYOUT_DIR}/cube-kernel-scf/vmlinux-pvm"
+  ensure_file "${RUNTIME_LAYOUT_DIR}/cube-kernel-scf/vmlinux-pvm"
+elif [[ -n "${ONE_CLICK_CUBE_KERNEL_PVM_VMLINUX:-}" ]]; then
+  die "PVM kernel vmlinux file not found: ${CUBE_KERNEL_PVM_VMLINUX}"
+else
+  log "PVM kernel vmlinux not found; packaging ordinary kernel only"
+fi
 
 log "runtime layout ready: ${RUNTIME_LAYOUT_DIR}"

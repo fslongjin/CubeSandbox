@@ -17,6 +17,7 @@ import (
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/controller"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/controller/runtemplate"
 	cubeletnodemeta "github.com/tencentcloud/CubeSandbox/Cubelet/pkg/cubelet/nodemeta"
+	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/cubelet/versioninfo"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/log"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/masterclient"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/networkagentclient"
@@ -29,6 +30,7 @@ import (
 	"k8s.io/utils/clock"
 
 	cubeimages "github.com/tencentcloud/CubeSandbox/Cubelet/internal/cube/server/images"
+	"github.com/tencentcloud/CubeSandbox/Cubelet/internal/tomlext"
 )
 
 const (
@@ -43,7 +45,7 @@ type KubeletConfig struct {
 
 	DisableCreateNode bool `toml:"disable_create_node,omitempty"`
 
-	NodeStatusUpdateFrequency time.Duration `toml:"node_status_update_frequency,omitempty"`
+	NodeStatusUpdateFrequency tomlext.Duration `toml:"node_status_update_frequency,omitempty"`
 }
 
 func DefaultCubeletConfig() *KubeletConfig {
@@ -51,7 +53,7 @@ func DefaultCubeletConfig() *KubeletConfig {
 		Insecurity:                true,
 		ResyncInterval:            10 * time.Hour,
 		DisableCreateNode:         false,
-		NodeStatusUpdateFrequency: 1 * time.Minute,
+		NodeStatusUpdateFrequency: tomlext.FromStdTime(10 * time.Second),
 	}
 }
 
@@ -111,6 +113,8 @@ type Cubelet struct {
 	networkAgentClient networkagentclient.Client
 	lastNodeSnapshot   *cubeletnodemeta.Node
 
+	versionCollector *versioninfo.Collector
+
 	closeCh chan struct{}
 }
 
@@ -149,8 +153,8 @@ func NewCubelet(
 		masterClient:              client,
 		config:                    mconfig,
 		registerNode:              !mconfig.DisableCreateNode,
-		nodeStatusUpdateFrequency: mconfig.NodeStatusUpdateFrequency,
-		nodeStatusReportFrequency: mconfig.NodeStatusUpdateFrequency,
+		nodeStatusUpdateFrequency: tomlext.ToStdTime(mconfig.NodeStatusUpdateFrequency),
+		nodeStatusReportFrequency: tomlext.ToStdTime(mconfig.NodeStatusUpdateFrequency),
 
 		criImage:           criImage,
 		rtManager:          rtManager,
@@ -159,8 +163,9 @@ func NewCubelet(
 
 		NodeLabels: nodeLabels,
 
-		clock:   clock.RealClock{},
-		closeCh: make(chan struct{}),
+		clock:            clock.RealClock{},
+		versionCollector: versioninfo.NewCollector(""),
+		closeCh:          make(chan struct{}),
 	}
 
 	clet.NodeHasSynced = func() bool { return true }

@@ -1,0 +1,29 @@
+{
+  "title": "Templates",
+  "subtitle": "Reusable snapshots used as the starting point of every sandbox.",
+  "noTemplates": "No templates yet. Use the CLI or SDK to publish a template.",
+  "col": {
+    "instance": "Instance",
+    "created": "Created",
+    "version": "version",
+    "image": "image"
+  },
+  "instanceDefault": "standard",
+  "create": {
+    "button": "New Template",
+    "title": "New Template",
+    "templateID": "Template ID",
+    "image": "image",
+    "instanceType": "instance-type",
+    "cancel": "Cancel",
+    "submit": "Create",
+    "creating": "Creating…",
+    "error": "Failed to create template.",
+    "writableLayerSize": "writable-layer-size",
+    "writableLayerSizeHint": "e.g. 1G, 2G",
+    "exposedPorts": "expose-port",
+    "exposedPortsHint": "Multiple ports separated by commas, e.g. 49983,9000.",
+    "probePort": "probe",
+    "probePath": "probe-path"
+  }
+}

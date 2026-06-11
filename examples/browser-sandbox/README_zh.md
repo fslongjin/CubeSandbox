@@ -62,12 +62,14 @@ playwright install chromium
 
 ```bash
 cubemastercli tpl create-from-image \
-  --image ccr.ccs.tencentyun.com/ags-image/sandbox-browser:latest \
+  --image cube-sandbox-cn.tencentcloudcr.com/cube-sandbox/sandbox-browser:latest \
   --writable-layer-size 1G \
   --expose-port 9000 \
   --probe 9000 \
   --probe-path /cdp/json/version
 ```
+
+> **镜像仓库说明：** 国内优先使用 `cube-sandbox-cn.tencentcloudcr.com/cube-sandbox/sandbox-browser:latest`；境外访问推荐使用 `cube-sandbox-int.tencentcloudcr.com/cube-sandbox/sandbox-browser:latest`。
 
 记录输出的 `template_id`。
 
@@ -81,12 +83,12 @@ cp .env.example .env
 或直接导出：
 
 ```bash
-export E2B_API_KEY=dummy
+export E2B_API_KEY=e2b_000000
 export E2B_API_URL=http://<节点IP>:3000
 export CUBE_TEMPLATE_ID=<template-id>
 
 # 使用 Cube 内置 mkcert 证书时才需要配置：
-# export NODE_EXTRA_CA_CERTS=$(mkcert -CAROOT)/rootCA.pem
+# export NODE_EXTRA_CA_CERTS=/root/.local/share/mkcert/rootCA.pem
 ```
 
 ### 第三步 — 运行示例
@@ -145,7 +147,7 @@ page.wait_for_load_state("networkidle")
 | 现象 | 可能原因 | 解决方法 |
 |------|---------|---------|
 | `Error: connect ECONNREFUSED` | CubeAPI 不可达 | 检查 `E2B_API_URL` 及端口 3000 是否开放 |
-| `SSL: CERTIFICATE_VERIFY_FAILED` | HTTPS 但未配置 CA 证书 | 设置 `NODE_EXTRA_CA_CERTS=$(mkcert -CAROOT)/rootCA.pem` |
+| `SSL: CERTIFICATE_VERIFY_FAILED` | HTTPS 但未配置 CA 证书 | 设置 `NODE_EXTRA_CA_CERTS=/root/.local/share/mkcert/rootCA.pem` |
 | `Timeout waiting for CDP` | Chromium 尚未就绪 | 浏览器镜像启动时会拉起 Chromium，稍后重试或增大超时 |
 | `Template not found` | 模板 ID 错误 | 重新运行 `cubemastercli tpl list` 确认 ID |
 

@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/gorilla/mux"
+	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/constants"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/log"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/errorcode"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/localcache"
@@ -52,12 +53,25 @@ func handleSandboxCommitAction(w http.ResponseWriter, r *http.Request, rt *CubeL
 			Res: &types.Res{Ret: &types.Ret{RetCode: int(errorcode.ErrorCode_MasterParamsError), RetMsg: err.Error()}},
 		}
 	}
-	if strings.TrimSpace(req.SandboxID) == "" || strings.TrimSpace(req.TemplateID) == "" || req.CreateRequest == nil {
+	if strings.TrimSpace(req.SandboxID) == "" || req.CreateRequest == nil {
 		return &commitTemplateResponse{
 			Res: &types.Res{Ret: &types.Ret{
 				RetCode: int(errorcode.ErrorCode_MasterParamsError),
-				RetMsg:  "sandbox_id, template_id and create_request are required",
+				RetMsg:  "sandbox_id and create_request are required",
 			}},
+		}
+	}
+	// Auto-generate the template ID before any later response can reference it.
+	// Users are not allowed to set custom template IDs because the snapshot
+	// system depends on the tpl- / snap- prefix convention.
+	req.TemplateID = templatecenter.GenerateTemplateID()
+	if strings.TrimSpace(req.RequestID) == "" {
+		return &commitTemplateResponse{
+			Res: &types.Res{Ret: &types.Ret{
+				RetCode: int(errorcode.ErrorCode_MasterParamsError),
+				RetMsg:  "requestID is required for commit; retry should generate a new request id",
+			}},
+			TemplateID: req.TemplateID,
 		}
 	}
 	if req.CreateRequest.Request == nil {
@@ -69,7 +83,7 @@ func handleSandboxCommitAction(w http.ResponseWriter, r *http.Request, rt *CubeL
 	if req.CreateRequest.Annotations == nil {
 		req.CreateRequest.Annotations = map[string]string{}
 	}
-	req.CreateRequest.Annotations["cube.master.appsnapshot.template.id"] = req.TemplateID
+	req.CreateRequest.Annotations[constants.CubeAnnotationAppSnapshotTemplateID] = req.TemplateID
 
 	hostIP := ""
 	if cache := localcache.GetSandboxCache(req.SandboxID); cache != nil {
@@ -118,13 +132,8 @@ func handleSandboxCommitAction(w http.ResponseWriter, r *http.Request, rt *CubeL
 	}))
 	job, err := templatecenter.SubmitTemplateCommit(ctx, req.SandboxID, hostID, hostIP, req.CreateRequest)
 	if err != nil {
-		code := int(errorcode.ErrorCode_MasterInternalError)
-		switch {
-		case errors.Is(err, templatecenter.ErrTemplateIDRequired), errors.Is(err, templatecenter.ErrDuplicateTemplate):
-			code = int(errorcode.ErrorCode_MasterParamsError)
-		case errors.Is(err, templatecenter.ErrTemplateStoreNotInitialized):
-			code = int(errorcode.ErrorCode_DBError)
-		}
+		code := commitTemplateErrorCode(err)
+		rt.RetCode = int64(code)
 		return &commitTemplateResponse{
 			Res: &types.Res{
 				RequestID: req.RequestID,
@@ -142,6 +151,19 @@ func handleSandboxCommitAction(w http.ResponseWriter, r *http.Request, rt *CubeL
 		},
 		TemplateID: req.TemplateID,
 		BuildID:    job.JobID,
+	}
+}
+
+func commitTemplateErrorCode(err error) int {
+	switch {
+	case errors.Is(err, templatecenter.ErrTemplateIDRequired),
+		errors.Is(err, templatecenter.ErrDuplicateTemplate),
+		errors.Is(err, templatecenter.ErrTemplateAttemptInProgress):
+		return int(errorcode.ErrorCode_MasterParamsError)
+	case errors.Is(err, templatecenter.ErrTemplateStoreNotInitialized):
+		return int(errorcode.ErrorCode_DBError)
+	default:
+		return int(errorcode.ErrorCode_MasterInternalError)
 	}
 }
 

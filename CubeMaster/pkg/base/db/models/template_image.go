@@ -27,6 +27,14 @@ type RootfsArtifact struct {
 	Status                  string `json:"status" gorm:"column:status"`
 	LastError               string `json:"last_error" gorm:"column:last_error"`
 	GCDeadline              int64  `json:"gc_deadline" gorm:"column:gc_deadline"`
+
+	// CubeEgress CA bake metadata (see design/cube-egress-ca-bake.md).
+	// Used for audit/triage; the artifact reuse cache key folds
+	// CubeEgressCAFingerprint into TemplateSpecFingerprint, so a CA
+	// rotation invalidates stale artifacts automatically.
+	CubeEgressCABaked          bool   `json:"cube_egress_ca_baked" gorm:"column:cube_egress_ca_baked"`
+	CubeEgressCAFingerprint    string `json:"cube_egress_ca_fingerprint" gorm:"column:cube_egress_ca_fingerprint"`
+	CubeEgressCATargetsWritten int    `json:"cube_egress_ca_targets_written" gorm:"column:cube_egress_ca_targets_written"`
 }
 
 func (RootfsArtifact) TableName() string {
@@ -37,6 +45,10 @@ type TemplateImageJob struct {
 	gorm.Model
 	JobID                   string `json:"job_id" gorm:"column:job_id"`
 	TemplateID              string `json:"template_id" gorm:"column:template_id"`
+	RequestID               string `json:"request_id" gorm:"column:request_id"`
+	SandboxID               string `json:"sandbox_id" gorm:"column:sandbox_id"`
+	ResourceType            string `json:"resource_type" gorm:"column:resource_type"`
+	ResourceID              string `json:"resource_id" gorm:"column:resource_id"`
 	AttemptNo               int32  `json:"attempt_no" gorm:"column:attempt_no"`
 	RetryOfJobID            string `json:"retry_of_job_id" gorm:"column:retry_of_job_id"`
 	Operation               string `json:"operation" gorm:"column:operation"`

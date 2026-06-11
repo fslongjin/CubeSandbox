@@ -130,7 +130,15 @@ rollback_host_dns() {
       if networkmanager_available; then
         systemctl restart NetworkManager >/dev/null 2>&1 || true
       fi
+      # Restore /etc/resolv.conf in case NM is not yet ready to repopulate it.
+      # With rc-manager back to its default after the conf removal+restart,
+      # NM will normally rewrite resolv.conf itself, but this is the safety net.
       restore_non_stub_resolv_conf
+      # The NM path now uses the same dummy link as the systemd-resolved
+      # path to host dnsmasq, so tear it down here as well.
+      if [[ -n "${iface}" ]] && link_exists "${iface}" && link_is_dummy "${iface}"; then
+        ip link delete "${iface}" >/dev/null 2>&1 || true
+      fi
       ;;
     "" )
       ;;
@@ -146,9 +154,7 @@ if [[ -f "${COREDNS_DIR}/docker-compose.yaml" ]]; then
   coredns_compose_run down --remove-orphans >/dev/null 2>&1 || true
 fi
 
-if container_exists "${COREDNS_CONTAINER}"; then
-  docker rm -f "${COREDNS_CONTAINER}" >/dev/null
-fi
+docker_rm_if_exists "${COREDNS_CONTAINER}"
 
 rollback_host_dns
 

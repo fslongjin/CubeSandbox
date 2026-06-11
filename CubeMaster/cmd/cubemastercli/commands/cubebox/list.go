@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"math/rand"
 	"net"
 	"net/http"
@@ -39,24 +40,24 @@ var ListCommand = cli.Command{
 		cli.IntFlag{
 			Name:  "index,i",
 			Value: 1,
-			Usage: "与size组合填写,cube物理机列表(以db中的主键id作为排序)起始位置,从1开始,与hostid互斥关系",
+			Usage: "Used with size; starting position of cube host list (sorted by primary key id in db), starts from 1, mutually exclusive with hostid",
 		},
 		cli.IntFlag{
 			Name:  "size,s",
 			Value: 1,
-			Usage: "与index组合填写,本次请求遍历的主机列表个数,与hostid互斥关系",
+			Usage: "Used with index; number of hosts to traverse in this request, mutually exclusive with hostid",
 		},
 		cli.StringFlag{
 			Name:  "hostid,t",
-			Usage: "与(index,size)必填一种，互斥关系",
+			Usage: "Required when (index,size) is not specified; mutually exclusive with (index,size)",
 		},
 		cli.BoolFlag{
 			Name:  "old",
-			Usage: "/cube/sandbox/info 旧接口用法",
+			Usage: "/cube/sandbox/info legacy API usage",
 		},
 		cli.StringSliceFlag{
 			Name:  "filter",
-			Usage: "过滤条件,支持多个,格式:key=value,key=value,key=value",
+			Usage: "Filter conditions, multiple supported, format: key=value,key=value,key=value",
 		},
 		cli.StringFlag{
 			Name:  "type",
@@ -65,7 +66,7 @@ var ListCommand = cli.Command{
 		},
 		cli.BoolFlag{
 			Name:  "delete",
-			Usage: "是否删除,必须与hostid配合使用",
+			Usage: "Whether to delete, must be used with hostid",
 		},
 		cli.BoolFlag{
 			Name:  "quiet, q",
@@ -95,12 +96,12 @@ var ListCommand = cli.Command{
 		}
 
 		if hostID == "" && (startIdx == 0 || size == 0) {
-			return errors.New("hostid和(start_idx、size)至少填写一种")
+			return errors.New("at least one of hostid or (start_idx, size) must be provided")
 		}
 
 		serverList = getServerAddrs(c)
 		if len(serverList) == 0 {
-			myPrint("no server addr")
+			log.Printf("no server addr\n")
 			return errors.New("no server addr")
 		}
 		port = c.GlobalString("port")
@@ -134,14 +135,14 @@ var ListCommand = cli.Command{
 
 		rsp, summary, err := runListQuery(c, host, req, filterList, all)
 		if err != nil {
-			myPrint("list_getBodyData err. %s. RequestId: %s", err.Error(), requestID)
+			log.Printf("list_getBodyData err. %s. RequestId: %s\n", err.Error(), requestID)
 			return err
 		}
 		if rsp.Ret == nil {
 			return errors.New("empty response")
 		}
 		if rsp.Ret.RetCode != 200 {
-			myPrint("rsp err. %s. RequestId: %s", rsp.Ret.RetMsg, requestID)
+			log.Printf("rsp err. %s. RequestId: %s\n", rsp.Ret.RetMsg, requestID)
 			return errors.New(rsp.Ret.RetMsg)
 		}
 
@@ -153,9 +154,9 @@ var ListCommand = cli.Command{
 					}
 					err = doInnerDestroySandbox(c, sandbox.SandboxID, sandbox.Labels, c.String("type"))
 					if err != nil {
-						myPrint("doDestroySandbox err. %s. RequestId: %s", err.Error(), requestID)
+						log.Printf("doDestroySandbox err. %s. RequestId: %s\n", err.Error(), requestID)
 					}
-					myPrint("doDestroySandbox success: %s", sandbox.SandboxID)
+					log.Printf("doDestroySandbox success: %s\n", sandbox.SandboxID)
 				} else {
 					fmt.Println(sandbox.SandboxID)
 				}
@@ -338,12 +339,12 @@ func getStatus(s int32) string {
 	case 2:
 		return "exited"
 	case 3:
-		return "unknow"
+		return "unknown"
 	case 4:
 		return "pausing"
 	case 5:
 		return "paused"
 	default:
-		return "unknow"
+		return "unknown"
 	}
 }

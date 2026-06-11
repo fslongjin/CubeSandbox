@@ -22,17 +22,15 @@ CubeVS 在报文可能经过的三个网络边界上各挂载一个 BPF 程序�
 
 | 程序 | 源文件 | 挂载点 | 方向 | 职责 |
 |------|--------|--------|------|------|
-| `from_cube` | `mvmtap.bpf.c` | 各 TAP 设备的 TC ingress | 沙箱 --> 宿主机 | SNAT、策略检查、会话创建、ARP 代理 |
+| `from_cube` | `mvmtap.bpf.c` | 各 TAP 设备的 TC ingress | 沙箱 --> 宿主机 | SNAT、策略检查、L7 代理选择、会话创建、ARP 代理 |
 | `from_world` | `nodenic.bpf.c` | 宿主机网卡 (eth0) 的 TC ingress | 外部 --> 宿主机 | 反向 NAT、端口映射代理 |
-| `from_envoy` | `localgw.bpf.c` | cube-dev 的 TC egress | Overlay --> 沙箱 | 将 Overlay 流量 DNAT 到沙箱 IP 并重定向至 TAP |
-
-此外还有一个轻量程序 `filter_from_cube`，通过 XDP 挂载在 cube-dev 上。它作为早期拒绝过滤器，在报文进入 TC 层之前丢弃未经请求的入站 TCP/UDP 报文，同时放行 ICMP 和属于已有会话的报文。
+| `from_envoy` | `localgw.bpf.c` | cube-dev 的 TC egress | Overlay / TPROXY 代理 --> 沙箱 | 将流量 DNAT 到沙箱 IP、保留透明代理远端源 IP 并重定向至 TAP |
 
 ### 1.3 Go 控制面
 
 `cubevs/` Go 包封装了 BPF 的生命周期管理：
 
-- **`Init()`** 加载并固定三个 BPF 目标文件，改写编译期常量（IP、MAC、接口索引），并挂载 TC / XDP 过滤器。
+- **`Init()`** 加载并固定三个 BPF 目标文件，改写编译期常量（IP、MAC、接口索引），并挂载 TC 过滤器。
 - **`AddTAPDevice()` / `DelTAPDevice()`** 注册和注销沙箱 TAP 设备，包括其元数据和网络策略。
 - **`AttachFilter()`** 在 TAP 设备上创建 clsact qdisc，并挂载 `from_cube` TC 过滤器。
 - **`SetSNATIPs()`** 填充 SNAT IP 池。
@@ -80,10 +78,11 @@ graph LR
 3. `from_cube` 首先检查目标是否为沙箱网关（`169.254.68.5`）。若是，说明这是 Overlay 流量 —— 过滤器将目标 DNAT 到 cube-dev 并重定向报文。
 4. 对于其他目标，`from_cube` 依次执行：
    - **评估网络策略**，根据目标 IP 决定放行或丢弃（详见[第 5 节](#5-网络策略)）。
-   - **创建或更新 NAT 会话**，写入 `egress_sessions` 和 `ingress_sessions`。
+   - **选择 L7 代理路径**：对命中策略且带 `L7_REQUIRED` 的 TCP `:80` / `:443` 报文，保留原始目的地址并 redirect 到 `cube-dev` ingress。主机 TPROXY 随后按 `iif cube-dev + dport 80/443` 匹配；不需要 fwmark。
+   - **创建或更新 NAT 会话**，对不需要 L7 代理的流量写入 `egress_sessions` 和 `ingress_sessions`。
    - **执行 SNAT**：将沙箱源 IP 和端口替换为 SNAT 池中的 IP 及动态分配的端口，同时更新 L3 和 L4 校验和。
    - **重定向**改写后的报文到宿主机网卡。
-5. 报文离开宿主机，发往外部网络。
+5. 普通报文离开宿主机发往外部网络；需要 L7 的 HTTP(S) 报文则通过 `cube-dev` 进入本机 TPROXY listener。
 
 ### 2.2 入站：外部网络到沙箱
 
@@ -102,19 +101,19 @@ graph LR
 - **基于会话的反向 NAT** —— 过滤器在 `ingress_sessions` 中查找报文的五元组。若匹配成功，则重建沙箱侧的原始五元组，执行反向 DNAT（将目标 IP 和端口改写回沙箱内部地址），并重定向报文到正确的 TAP 设备。
 - **端口映射代理** —— 若会话未匹配，过滤器根据目标端口查找 `remote_port_mapping`。若匹配成功，说明这是沙箱对外暴露服务的入站连接。过滤器将目标 DNAT 到沙箱的监听端口并重定向至 TAP。
 
-### 2.3 Overlay 流量：Envoy 到沙箱
+### 2.3 本机代理 / Overlay 到沙箱流量
 
-来自 Overlay 网络的流量（例如来自 Sidecar 代理）通过 cube-dev 进入：
+来自本机透明代理或 Overlay 网络的流量通过 cube-dev 进入：
 
 ```mermaid
 graph LR
-    A["Overlay / Envoy"] -->|报文| B["cube-dev"]
+    A["OpenResty TPROXY / Overlay"] -->|报文| B["cube-dev"]
     B -->|TC egress| C["from_envoy<br/>(localgw.bpf.c)"]
     C -->|DNAT 到沙箱 IP<br/>重定向| D["TAP 设备"]
     D --> E["沙箱"]
 ```
 
-`from_envoy` 将目标 IP 从 Overlay 地址改写为沙箱内部 IP（`169.254.68.6`），源地址设为网关 IP（`169.254.68.5`），然后通过查找 `mvmip_to_ifindex` 将报文重定向到对应的 TAP 设备。
+`from_envoy` 将目标 IP 从代理/Overlay 侧地址改写为沙箱内部 IP（`169.254.68.6`），然后通过查找 `mvmip_to_ifindex` 将报文重定向到对应的 TAP 设备。源地址 SNAT 是有条件的：网关自身发出的报文（`src == cubegw0_ip`）会改写为沙箱网关 IP（`169.254.68.5`），而 IP_TRANSPARENT 代理回包会保留原始远端源 IP，让沙箱看到真实对端。
 
 ---
 
@@ -184,7 +183,7 @@ CubeVS 实现了一个参照 Linux 内核 `nf_conntrack` 的 TCP 连接跟踪状
 
 DNAT 发生在三种场景中：
 
-1. **Overlay 流量**（cube-dev 上的 `from_envoy`）—— 目标 IP 从 Overlay 地址改写为沙箱内部 IP（`169.254.68.6`），源地址设为网关地址（`169.254.68.5`）。报文被重定向到正确的 TAP 设备。
+1. **本机代理 / Overlay 流量**（cube-dev 上的 `from_envoy`）—— 目标 IP 从代理/Overlay 侧地址改写为沙箱内部 IP（`169.254.68.6`）。网关自身发出的报文源地址会改为沙箱网关地址（`169.254.68.5`），但 IP_TRANSPARENT 代理回包会保留原始远端源 IP。报文被重定向到正确的 TAP 设备。
 
 2. **会话回复流量**（宿主机网卡上的 `from_world`）—— 目标 IP 和端口从节点的 SNAT 地址改写回沙箱的原始源地址和端口。`ingress_sessions` 中的反向查找提供了沙箱侧的坐标。
 
@@ -270,6 +269,16 @@ CubeVS 完全在内核态执行逐沙箱的出站网络策略，使用 LPM（最
 
 Go API 提供了 `AddPortMapping()`、`DelPortMapping()`、`ListPortMapping()` 和 `GetPortMapping()`，用于在运行时管理映射关系。
 
+### 6.4 计算节点端口分配
+
+为避免不同子系统之间的端口冲突，计算节点上的可用端口被划分为三段：
+
+| 端口范围 | 用途 | 分配者 |
+|----------|------|--------|
+| `10000`--`19999` | `ip_local_port_range`（宿主机临时端口） | 由 network-agent 启动时修改 |
+| `20000`--`29999` | CubeProxy 访问沙箱所用的端口范围 | 由 network-agent 在创建沙箱时分配 |
+| `30000`--`65535` | 沙箱出站报文经主机 NAT 时使用的端口范围 | 由 CubeVS 在 SNAT 时分配 |
+
 ---
 
 ## 7. TAP 设备生命周期
@@ -323,8 +332,6 @@ TAP 设备在操作系统层面创建后，`AttachFilter(ifindex)` 加载已固�
    - `from_world` 挂载到宿主机网卡的 TC ingress hook（处理外部到沙箱的回复流量）。
    - `from_world` 也挂载到回环接口以确保完备性。
 
-4. **挂载 XDP** —— `filter_from_cube` 挂载到 cube-dev 的 XDP hook。这提供了对未经请求的入站 TCP/UDP 流量的早期高性能拒绝，使其在到达 TC 层之前即被丢弃。
-
 ### 8.2 常量改写
 
 BPF 程序无法在运行时读取配置文件。CubeVS 采用了 eBPF 生态中常见的模式：BPF C 源码中的全局变量编译为常量，Go 加载器在将 ELF 对象加载到内核之前改写这些值。这种方式兼具编译期常量的性能优势（验证器可优化分支）和运行时配置的灵活性。
@@ -360,7 +367,7 @@ graph TB
     end
     
     subgraph "宿主机内核"
-        CD["cube-dev<br/>(from_envoy + XDP 过滤器)"]
+        CD["cube-dev<br/>(from_envoy)"]
         NIC["宿主机网卡 - eth0<br/>(from_world)"]
     end
     

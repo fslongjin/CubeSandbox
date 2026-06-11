@@ -77,6 +77,8 @@ func (em *eventMonitor) subscribe(subscriber events.Subscriber) {
 	filters := []string{
 		`topic=="/tasks/exit"`,
 		`topic=="/tasks/oom"`,
+		`topic=="/tasks/paused"`,
+		`topic=="/tasks/resumed"`,
 		`topic~="/images/"`,
 	}
 	em.ch, em.errCh = subscriber.Subscribe(em.ctx, filters...)
@@ -101,6 +103,10 @@ func convertEvent(e typeurl.Any) (string, interface{}, error) {
 	case *eventtypes.ImageDelete:
 		id = e.Name
 	case *eventtypes.TaskExit:
+		id = e.ContainerID
+	case *eventtypes.TaskPaused:
+		id = e.ContainerID
+	case *eventtypes.TaskResumed:
 		id = e.ContainerID
 	default:
 		return "", nil, errors.New("unsupported event")
@@ -251,6 +257,70 @@ func (em *eventMonitor) handleEvent(ctx context.Context, any interface{}) error 
 			return status, nil
 		})
 		return em.c.cubeboxManger.SyncByID(ctx, cntr.ID)
+	case *eventtypes.TaskPaused:
+		if strings.HasPrefix(e.ContainerID, "exec-") {
+			return nil
+		}
+		cntr, cb, err = em.c.cubeboxManger.FindContainerOfCubebox(ctx, e.ContainerID)
+		if err != nil && !errdefs.IsNotFound(err) {
+			return fmt.Errorf("failed to find container of cubebox: %w", err)
+		}
+		if cb == nil {
+			return nil
+		}
+		if cb.Namespace != "" {
+			ctx = namespaces.WithNamespace(ctx, cb.Namespace)
+		}
+		cb.Lock()
+		defer cb.Unlock()
+		// Do not backfill paused semantics once it has entered a terminal state.
+		if cb.UserMarkDeletedTime != nil {
+			return nil
+		}
+		if cntr != nil && cntr.Status != nil && cntr.Status.IsTerminated() {
+			return nil
+		}
+		// Idempotent: converge PausedAt/PausingAt of all containers to PAUSED.
+		for _, c := range cb.AllContainers() {
+			if c.Status == nil {
+				continue
+			}
+			c.Status.Update(func(status cubeboxstore.Status) (cubeboxstore.Status, error) {
+				if status.PausedAt == 0 {
+					status.PausedAt = time.Now().UnixNano()
+				}
+				status.PausingAt = 0
+				return status, nil
+			})
+		}
+		return em.c.cubeboxManger.SyncByID(ctx, cb.ID)
+	case *eventtypes.TaskResumed:
+		if strings.HasPrefix(e.ContainerID, "exec-") {
+			return nil
+		}
+		cntr, cb, err = em.c.cubeboxManger.FindContainerOfCubebox(ctx, e.ContainerID)
+		if err != nil && !errdefs.IsNotFound(err) {
+			return fmt.Errorf("failed to find container of cubebox: %w", err)
+		}
+		if cb == nil {
+			return nil
+		}
+		if cb.Namespace != "" {
+			ctx = namespaces.WithNamespace(ctx, cb.Namespace)
+		}
+		cb.Lock()
+		defer cb.Unlock()
+		if cb.UserMarkDeletedTime != nil {
+			return nil
+		}
+		if cntr != nil && cntr.Status != nil && cntr.Status.IsTerminated() {
+			return nil
+		}
+		// Resume is an opaque restore from CubeShim's internal pause snapshot, so
+		// use the shared converger that also invalidates stale runtime snapshot
+		// bindings before the next CommitSandbox.
+		convergeResumeStateAfterOpaqueRestore(cb, time.Now().UTC())
+		return em.c.cubeboxManger.SyncByID(ctx, cb.ID)
 	case *eventtypes.ImageCreate:
 		log.G(ctx).Infof("image create event: %+v", e)
 		return em.c.criImage.UpdateImage(ctx, e.Name)
@@ -270,6 +340,20 @@ func (em *eventMonitor) handleEvent(ctx context.Context, any interface{}) error 
 
 func (em *eventMonitor) handleContainerExit(ctx context.Context, e *eventtypes.TaskExit, cntr *cubeboxstore.Container) error {
 	if cntr.Status != nil && cntr.Status.Get().Removing {
+		return nil
+	}
+	if cntr.Status != nil && cntr.Status.Get().RollingBack {
+		// Snapshot rollback intentionally tears down the OLD VM via shim
+		// delete_vm before bringing up the restored VM via
+		// resume_vm_with_config. The OLD VM's TaskExit event is delivered
+		// to us during/right after that sequence; if we let the default
+		// handler run we (a) call task.Delete(WithProcessKill) which can
+		// race with the freshly-resumed task slot, and (b) stamp
+		// FinishedAt + ExitCode onto the cubebox status, making
+		// IsTerminated() return true and breaking a follow-up pause/
+		// resume. RollbackSandbox is responsible for resyncing the
+		// status; defer to it. See Cubelet/services/cubebox/rollback.go.
+		log.G(ctx).Infof("ignoring TaskExit for container %s: rollback in flight", e.ID)
 		return nil
 	}
 	if cntr.Container == nil {

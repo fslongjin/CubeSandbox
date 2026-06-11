@@ -3,7 +3,7 @@
 This guide explains how to expand a single-node Cube Sandbox deployment into a multi-node cluster by adding **compute nodes**. Compute nodes run only the sandbox runtime components (`Cubelet`, `network-agent`, `CubeShim`) and register themselves to the control plane on the first machine.
 
 ::: tip Prerequisite
-You must have a working control node deployed via the [Self-Build Deployment Guide](./self-build-deploy) before adding compute nodes.
+You must have a working control node deployed via the [Self-Build Deployment Guide](./self-build-deploy.md) before adding compute nodes.
 :::
 
 ## Architecture Overview
@@ -11,8 +11,8 @@ You must have a working control node deployed via the [Self-Build Deployment Gui
 ```
 ┌─────────────────────────────────────────┐
 │           Control Node                  │
-│  CubeMaster, cube-api, CubeProxy,      │
-│  CoreDNS, MySQL, Redis,                │
+│  CubeMaster, cube-api, CubeProxy,       │
+│  CoreDNS, MySQL, Redis,                 │
 │  Cubelet, network-agent                 │
 └──────────────────┬──────────────────────┘
                    │  /internal/meta API
@@ -37,7 +37,7 @@ Each compute node must meet the same hardware and software requirements as the c
 - **Docker** installed and running
 - **Network connectivity** to the control node (specifically to `CubeMaster` on port `8089` by default)
 
-For the full requirements list, see [Self-Build Deployment — Prerequisites](./self-build-deploy#prerequisites).
+For the full requirements list, see [Self-Build Deployment — Prerequisites](./self-build-deploy.md#prerequisites).
 
 ## Step 1: Prepare the Release Bundle
 
@@ -137,7 +137,7 @@ To reinstall a compute node, simply run `install-compute.sh` again. The script a
 | Runtime PID files | `/var/run/cube-sandbox-one-click/` |
 | Process stdout/stderr | `/var/log/cube-sandbox-one-click/` |
 
-For control-node log paths, see [Self-Build Deployment — View Logs](./self-build-deploy#view-logs).
+For control-node log paths, see [Self-Build Deployment — View Logs](./self-build-deploy.md#view-logs).
 
 ## Configuration Reference
 
@@ -149,10 +149,12 @@ Compute nodes use the same `.env` file format. The following variables are speci
 | `ONE_CLICK_CONTROL_PLANE_IP` | empty | Control-plane host IP; expanded to `<ip>:8089` by default |
 | `ONE_CLICK_CONTROL_PLANE_CUBEMASTER_ADDR` | empty | Explicit CubeMaster address; takes precedence over `ONE_CLICK_CONTROL_PLANE_IP` |
 | `CUBE_SANDBOX_NODE_IP` | `10.0.0.10` | **Required.** This node's primary network interface IP |
+| `CUBE_SANDBOX_NETWORK_CIDR` | `192.168.0.0/18` (from `config.toml`) | cubevs local network CIDR. Should match the control-plane value. IPv4 CIDR format (e.g., `10.100.0.0/18`), mask range /8–/30. Auto-detected for host network conflicts at install time. |
+| `CUBE_SANDBOX_NETWORK_CIDR_SKIP_CONFLICT_CHECK` | `0` | Set to `1` to skip CIDR conflict detection (not recommended). |
 | `ONE_CLICK_INSTALL_PREFIX` | `/usr/local/services/cubetoolbox` | Installation directory |
 | `ONE_CLICK_RUN_QUICKCHECK` | `1` | Run health check after installation |
 
-For the full configuration reference (build-time options, database, proxy, etc.), see [Self-Build Deployment — Configuration Reference](./self-build-deploy#configuration-reference).
+For the full configuration reference (build-time options, database, proxy, etc.), see [Self-Build Deployment — Configuration Reference](./self-build-deploy.md#configuration-reference).
 
 ## Troubleshooting
 
@@ -176,4 +178,4 @@ If `smoke.sh` passes locally but the node does not appear on the control plane:
 2. Verify `meta_server_endpoint` in the Cubelet config points to the correct CubeMaster address
 3. Ensure `CUBE_SANDBOX_NODE_IP` is correctly set to a routable IP (not `127.0.0.1`)
 
-For general troubleshooting (Docker, KVM, DNS, etc.), see [Self-Build Deployment — Troubleshooting](./self-build-deploy#troubleshooting).
+For general troubleshooting (Docker, KVM, DNS, etc.), see [Self-Build Deployment — Troubleshooting](./self-build-deploy.md#troubleshooting).

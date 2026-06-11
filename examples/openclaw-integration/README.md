@@ -78,12 +78,14 @@ CubeProxy exposes **both HTTPS (port 443) and HTTP (port 80)** simultaneously:
 
 ```bash
 cubemastercli tpl create-from-image \
-  --image ccr.ccs.tencentyun.com/ags-image/sandbox-code:latest \
+  --image cube-sandbox-int.tencentcloudcr.com/cube-sandbox/sandbox-code:latest \
   --writable-layer-size 1G \
   --expose-port 49999 \
   --expose-port 49983 \
   --probe 49999
 ```
+
+> **Image registry:** Use `cube-sandbox-int.tencentcloudcr.com/cube-sandbox/sandbox-code:latest` (recommended for international access). If you are in mainland China, use `cube-sandbox-cn.tencentcloudcr.com/cube-sandbox/sandbox-code:latest` instead.
 
 Note the `template_id` printed on success.
 
@@ -105,10 +107,10 @@ Set the following in your shell or OpenClaw environment:
 ```bash
 export CUBE_TEMPLATE_ID=<template-id>       # from Step 3
 export E2B_API_URL=http://<node-ip>:3000    # Cube API Server address
-export E2B_API_KEY=dummy                    # any non-empty string
+export E2B_API_KEY=e2b_000000                    # any non-empty string
 
 # Only needed when using Cube's built-in mkcert certificate:
-# export SSL_CERT_FILE=$(mkcert -CAROOT)/rootCA.pem
+# export SSL_CERT_FILE=/root/.local/share/mkcert/rootCA.pem
 ```
 
 ## 5. Usage
@@ -156,7 +158,7 @@ The skill file is at `examples/openclaw-integration/skills/cube-sandbox/SKILL.md
 | Symptom | Likely Cause | Fix |
 |---------|-------------|-----|
 | Skill not triggered | Skill not installed | Verify `~/.openclaw/workspace/skills/cube-sandbox/` exists |
-| `SSL: CERTIFICATE_VERIFY_FAILED` | HTTPS without CA cert | Set `SSL_CERT_FILE=$(mkcert -CAROOT)/rootCA.pem` |
+| `SSL: CERTIFICATE_VERIFY_FAILED` | HTTPS without CA cert | Set `SSL_CERT_FILE=/root/.local/share/mkcert/rootCA.pem` |
 | `Template not found` | Wrong `CUBE_TEMPLATE_ID` | Re-run `cubemastercli tpl list` |
 | DNS resolution fails | DNS not configured | See skill FAQ for `/etc/hosts` workaround |
 

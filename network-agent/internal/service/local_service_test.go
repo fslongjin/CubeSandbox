@@ -6,20 +6,22 @@ package service
 
 import (
 	"errors"
+	"fmt"
 	"net"
 	"os"
+	"slices"
 	"testing"
 
-	"github.com/tencentcloud/CubeSandbox/CubeNet/cubevs"
 	"github.com/cilium/ebpf"
+	"github.com/tencentcloud/CubeSandbox/CubeNet/cubevs"
 	"github.com/vishvananda/netlink"
 )
 
 func TestCubeVSTapRegistration(t *testing.T) {
-	opts := cubeVSTapRegistration(&CubeVSContext{
+	opts := cubeVSTapRegistration(&CubeNetworkConfig{
 		AllowInternetAccess: boolPtr(true),
-		AllowOut:        []string{"10.0.0.0/8"},
-		DenyOut:         []string{"192.168.0.0/16"},
+		AllowOut:            []string{"10.0.0.0/8"},
+		DenyOut:             []string{"192.168.0.0/16"},
 	})
 	if opts.AllowInternetAccess == nil || *opts.AllowInternetAccess != true {
 		t.Fatalf("opts.AllowInternetAccess=%v, want true", opts.AllowInternetAccess)
@@ -33,7 +35,7 @@ func TestCubeVSTapRegistration(t *testing.T) {
 }
 
 func TestCubeVSTapRegistrationBlockAll(t *testing.T) {
-	opts := cubeVSTapRegistration(&CubeVSContext{
+	opts := cubeVSTapRegistration(&CubeNetworkConfig{
 		AllowInternetAccess: boolPtr(false),
 	})
 	if opts.AllowInternetAccess == nil || *opts.AllowInternetAccess != false {
@@ -41,18 +43,54 @@ func TestCubeVSTapRegistrationBlockAll(t *testing.T) {
 	}
 }
 
-func TestRefreshCubeVSTapReattachesFilter(t *testing.T) {
+func TestCubeVSTapRegistrationExtractsL7AllowOut(t *testing.T) {
+	sni := "API.Example.COM."
+	sniWildcard := "*.SNI.Example.COM"
+	hostIP := "1.2.3.4:443"
+	hostCIDR := "10.1.2.3/8"
+	hostDomain := "Gateway.Example.COM:8443"
+	hostWildcard := "*.Gateway.Example.COM"
+	duplicateHost := "gateway.example.com"
+	invalidHost := "999.999.999.999"
+	opts := cubeVSTapRegistration(&CubeNetworkConfig{
+		AllowOut: []string{"8.8.8.8"},
+		Rules: []*EgressRule{
+			{Match: &EgressRuleMatch{SNI: &sni, Host: &hostIP}},
+			{Match: &EgressRuleMatch{Host: &hostCIDR}},
+			{Match: &EgressRuleMatch{Host: &hostDomain}},
+			{Match: &EgressRuleMatch{SNI: &sni}},
+			{Match: &EgressRuleMatch{SNI: &sniWildcard}},
+			{Match: &EgressRuleMatch{Host: &hostWildcard}},
+			{Match: &EgressRuleMatch{Host: &duplicateHost}},
+			{Match: &EgressRuleMatch{Host: &invalidHost}},
+			{Match: &EgressRuleMatch{Path: stringPtr("/v1/chat")}},
+		},
+	})
+	if opts.AllowOut == nil || len(*opts.AllowOut) != 1 || (*opts.AllowOut)[0] != "8.8.8.8" {
+		t.Fatalf("opts.AllowOut=%v, want [8.8.8.8]", opts.AllowOut)
+	}
+	if opts.L7AllowOut == nil {
+		t.Fatal("opts.L7AllowOut=nil, want extracted targets")
+	}
+	want := []string{"api.example.com", "1.2.3.4", "10.0.0.0/8", "gateway.example.com", "*.sni.example.com", "*.gateway.example.com"}
+	if got := *opts.L7AllowOut; !slices.Equal(got, want) {
+		t.Fatalf("opts.L7AllowOut=%v, want %v", got, want)
+	}
+}
+
+func TestRefreshCubeVSTapForRecoverReattachesFilterWithoutPolicyUpsert(t *testing.T) {
 	oldAttach := cubevsAttachFilter
 	oldGet := cubevsGetTAPDevice
-	oldAdd := cubevsAddTAPDevice
+	oldUpsert := cubevsUpsertTAPDevice
+	oldUpsertMeta := cubevsUpsertTAPDeviceMeta
 	t.Cleanup(func() {
 		cubevsAttachFilter = oldAttach
 		cubevsGetTAPDevice = oldGet
-		cubevsAddTAPDevice = oldAdd
+		cubevsUpsertTAPDevice = oldUpsert
+		cubevsUpsertTAPDeviceMeta = oldUpsertMeta
 	})
 
 	attachCalls := 0
-	addCalls := 0
 	cubevsAttachFilter = func(ifindex uint32) error {
 		attachCalls++
 		if ifindex != 17 {
@@ -66,8 +104,12 @@ func TestRefreshCubeVSTapReattachesFilter(t *testing.T) {
 		}
 		return &cubevs.TAPDevice{Ifindex: int(ifindex)}, nil
 	}
-	cubevsAddTAPDevice = func(uint32, net.IP, string, uint32, cubevs.MVMOptions) error {
-		addCalls++
+	cubevsUpsertTAPDevice = func(uint32, net.IP, string, uint32, cubevs.MVMOptions) error {
+		t.Fatal("UpsertTAPDevice should not be called during recover")
+		return nil
+	}
+	cubevsUpsertTAPDeviceMeta = func(uint32, net.IP, string, uint32) error {
+		t.Fatal("UpsertTAPDeviceMeta should not be called when metadata exists")
 		return nil
 	}
 
@@ -81,25 +123,24 @@ func TestRefreshCubeVSTapReattachesFilter(t *testing.T) {
 		},
 	}
 
-	if err := svc.refreshCubeVSTap(state); err != nil {
-		t.Fatalf("refreshCubeVSTap error=%v", err)
+	if err := svc.refreshCubeVSTapForRecover(state); err != nil {
+		t.Fatalf("refreshCubeVSTapForRecover error=%v", err)
 	}
 	if attachCalls != 1 {
 		t.Fatalf("AttachFilter calls=%d, want 1", attachCalls)
 	}
-	if addCalls != 0 {
-		t.Fatalf("AddTAPDevice calls=%d, want 0", addCalls)
-	}
 }
 
-func TestRefreshCubeVSTapReRegistersMissingMapEntry(t *testing.T) {
+func TestRefreshCubeVSTapForRecoverRestoresMissingMetadataOnly(t *testing.T) {
 	oldAttach := cubevsAttachFilter
 	oldGet := cubevsGetTAPDevice
-	oldAdd := cubevsAddTAPDevice
+	oldUpsert := cubevsUpsertTAPDevice
+	oldUpsertMeta := cubevsUpsertTAPDeviceMeta
 	t.Cleanup(func() {
 		cubevsAttachFilter = oldAttach
 		cubevsGetTAPDevice = oldGet
-		cubevsAddTAPDevice = oldAdd
+		cubevsUpsertTAPDevice = oldUpsert
+		cubevsUpsertTAPDeviceMeta = oldUpsertMeta
 	})
 
 	cubevsAttachFilter = func(ifindex uint32) error {
@@ -111,21 +152,22 @@ func TestRefreshCubeVSTapReRegistersMissingMapEntry(t *testing.T) {
 	cubevsGetTAPDevice = func(uint32) (*cubevs.TAPDevice, error) {
 		return nil, ebpf.ErrKeyNotExist
 	}
+	cubevsUpsertTAPDevice = func(uint32, net.IP, string, uint32, cubevs.MVMOptions) error {
+		t.Fatal("UpsertTAPDevice should not be called during recover")
+		return nil
+	}
 
 	var (
 		gotIfindex uint32
 		gotIP      string
 		gotID      string
 	)
-	cubevsAddTAPDevice = func(ifindex uint32, ip net.IP, id string, version uint32, opts cubevs.MVMOptions) error {
+	cubevsUpsertTAPDeviceMeta = func(ifindex uint32, ip net.IP, id string, version uint32) error {
 		gotIfindex = ifindex
 		gotIP = ip.String()
 		gotID = id
 		if version == 0 {
 			t.Fatal("version=0, want incremented version")
-		}
-		if opts.AllowInternetAccess == nil || *opts.AllowInternetAccess != true {
-			t.Fatalf("opts.AllowInternetAccess=%v, want true", opts.AllowInternetAccess)
 		}
 		return nil
 	}
@@ -137,28 +179,30 @@ func TestRefreshCubeVSTapReRegistersMissingMapEntry(t *testing.T) {
 			TapName:    "z192.168.0.8",
 			TapIfIndex: 23,
 			SandboxIP:  "192.168.0.8",
-			CubeVSContext: &CubeVSContext{
+			CubeNetworkConfig: &CubeNetworkConfig{
 				AllowInternetAccess: boolPtr(true),
 			},
 		},
 	}
 
-	if err := svc.refreshCubeVSTap(state); err != nil {
-		t.Fatalf("refreshCubeVSTap error=%v", err)
+	if err := svc.refreshCubeVSTapForRecover(state); err != nil {
+		t.Fatalf("refreshCubeVSTapForRecover error=%v", err)
 	}
 	if gotIfindex != 23 || gotIP != "192.168.0.8" || gotID != "sandbox-2" {
-		t.Fatalf("AddTAPDevice got ifindex=%d ip=%s id=%s", gotIfindex, gotIP, gotID)
+		t.Fatalf("UpsertTAPDeviceMeta got ifindex=%d ip=%s id=%s", gotIfindex, gotIP, gotID)
 	}
 }
 
-func TestRefreshCubeVSTapPropagatesAttachFilterError(t *testing.T) {
+func TestRefreshCubeVSTapForRecoverPropagatesAttachFilterError(t *testing.T) {
 	oldAttach := cubevsAttachFilter
 	oldGet := cubevsGetTAPDevice
-	oldAdd := cubevsAddTAPDevice
+	oldUpsert := cubevsUpsertTAPDevice
+	oldUpsertMeta := cubevsUpsertTAPDeviceMeta
 	t.Cleanup(func() {
 		cubevsAttachFilter = oldAttach
 		cubevsGetTAPDevice = oldGet
-		cubevsAddTAPDevice = oldAdd
+		cubevsUpsertTAPDevice = oldUpsert
+		cubevsUpsertTAPDeviceMeta = oldUpsertMeta
 	})
 
 	wantErr := errors.New("attach failed")
@@ -167,8 +211,12 @@ func TestRefreshCubeVSTapPropagatesAttachFilterError(t *testing.T) {
 		t.Fatal("GetTAPDevice should not be called when attach fails")
 		return nil, nil
 	}
-	cubevsAddTAPDevice = func(uint32, net.IP, string, uint32, cubevs.MVMOptions) error {
-		t.Fatal("AddTAPDevice should not be called when attach fails")
+	cubevsUpsertTAPDevice = func(uint32, net.IP, string, uint32, cubevs.MVMOptions) error {
+		t.Fatal("UpsertTAPDevice should not be called when attach fails")
+		return nil
+	}
+	cubevsUpsertTAPDeviceMeta = func(uint32, net.IP, string, uint32) error {
+		t.Fatal("UpsertTAPDeviceMeta should not be called when attach fails")
 		return nil
 	}
 
@@ -181,9 +229,9 @@ func TestRefreshCubeVSTapPropagatesAttachFilterError(t *testing.T) {
 		},
 	}
 
-	err := svc.refreshCubeVSTap(state)
+	err := svc.refreshCubeVSTapForRecover(state)
 	if !errors.Is(err, wantErr) {
-		t.Fatalf("refreshCubeVSTap error=%v, want %v", err, wantErr)
+		t.Fatalf("refreshCubeVSTapForRecover error=%v, want %v", err, wantErr)
 	}
 }
 
@@ -231,7 +279,7 @@ func TestRecoverCleansOrphanTapsWithoutPersistedState(t *testing.T) {
 		store:             store,
 		allocator:         allocator,
 		ports:             &portAllocator{assigned: make(map[uint16]struct{})},
-		cfg:               Config{CIDR: "192.168.0.0/18", MVMMacAddr: "20:90:6f:fc:fc:fc", MvmMtu: 1300},
+		cfg:               Config{CIDR: "192.168.0.0/18", MVMMacAddr: "20:90:6f:fc:fc:fc", MvmMtu: 1500},
 		cubeDev:           &cubeDev{Index: 16},
 		states:            make(map[string]*managedState),
 		destroyFailedTaps: make(map[string]*tapDevice),
@@ -253,6 +301,8 @@ func TestRecoverKeepsPersistedTapAndRemovesOnlyOrphans(t *testing.T) {
 	oldAttach := cubevsAttachFilter
 	oldGetTap := cubevsGetTAPDevice
 	oldAdd := cubevsAddTAPDevice
+	oldUpsert := cubevsUpsertTAPDevice
+	oldUpsertMeta := cubevsUpsertTAPDeviceMeta
 	oldListCubeVSTaps := cubevsListTAPDevices
 	oldListPortMappings := cubevsListPortMappings
 	oldARP := addARPEntryFunc
@@ -264,6 +314,8 @@ func TestRecoverKeepsPersistedTapAndRemovesOnlyOrphans(t *testing.T) {
 		cubevsAttachFilter = oldAttach
 		cubevsGetTAPDevice = oldGetTap
 		cubevsAddTAPDevice = oldAdd
+		cubevsUpsertTAPDevice = oldUpsert
+		cubevsUpsertTAPDeviceMeta = oldUpsertMeta
 		cubevsListTAPDevices = oldListCubeVSTaps
 		cubevsListPortMappings = oldListPortMappings
 		addARPEntryFunc = oldARP
@@ -315,6 +367,11 @@ func TestRecoverKeepsPersistedTapAndRemovesOnlyOrphans(t *testing.T) {
 	cubevsAddTAPDevice = func(uint32, net.IP, string, uint32, cubevs.MVMOptions) error {
 		return nil
 	}
+	cubevsUpsertTAPDevice = func(uint32, net.IP, string, uint32, cubevs.MVMOptions) error {
+		t.Fatal("UpsertTAPDevice should not be called during recover")
+		return nil
+	}
+	cubevsUpsertTAPDeviceMeta = func(uint32, net.IP, string, uint32) error { return nil }
 	cubevsListTAPDevices = func() ([]cubevs.TAPDevice, error) { return nil, nil }
 	cubevsListPortMappings = func() (map[uint16]cubevs.MVMPort, error) { return map[uint16]cubevs.MVMPort{}, nil }
 	addARPEntryFunc = func(net.IP, string, int) error { return nil }
@@ -334,7 +391,7 @@ func TestRecoverKeepsPersistedTapAndRemovesOnlyOrphans(t *testing.T) {
 		cfg: Config{
 			CIDR:       "192.168.0.0/18",
 			MVMMacAddr: "20:90:6f:fc:fc:fc",
-			MvmMtu:     1300,
+			MvmMtu:     1500,
 		},
 		cubeDev:           &cubeDev{Index: 16},
 		states:            make(map[string]*managedState),
@@ -422,7 +479,7 @@ func TestRecoverDropsStalePersistedStateWithoutBlockingStartup(t *testing.T) {
 		store:             store,
 		allocator:         allocator,
 		ports:             &portAllocator{assigned: make(map[uint16]struct{})},
-		cfg:               Config{CIDR: "192.168.0.0/18", MVMMacAddr: "20:90:6f:fc:fc:fc", MvmMtu: 1300},
+		cfg:               Config{CIDR: "192.168.0.0/18", MVMMacAddr: "20:90:6f:fc:fc:fc", MvmMtu: 1500},
 		cubeDev:           &cubeDev{Index: 16},
 		states:            make(map[string]*managedState),
 		destroyFailedTaps: make(map[string]*tapDevice),
@@ -502,7 +559,7 @@ func TestEnsureReleaseEnsureReusesTapFromPool(t *testing.T) {
 		store:             store,
 		allocator:         allocator,
 		ports:             &portAllocator{min: 10000, max: 10100, next: 10000, assigned: make(map[uint16]struct{})},
-		cfg:               Config{CIDR: "192.168.0.0/18", MVMInnerIP: "169.254.68.6", MVMMacAddr: "20:90:6f:fc:fc:fc", MvmGwDestIP: "169.254.68.5", MvmMask: 30, MvmMtu: 1300},
+		cfg:               Config{CIDR: "192.168.0.0/18", MVMInnerIP: "169.254.68.6", MVMMacAddr: "20:90:6f:fc:fc:fc", MvmGwDestIP: "169.254.68.5", MvmMask: 30, MvmMtu: 1500},
 		cubeDev:           &cubeDev{Index: 16},
 		states:            make(map[string]*managedState),
 		destroyFailedTaps: make(map[string]*tapDevice),
@@ -536,22 +593,26 @@ func TestEnsureReleaseEnsureReusesTapFromPool(t *testing.T) {
 func TestGetTapFileRestoresMissingFD(t *testing.T) {
 	oldList := listCubeTapsFunc
 	oldRestore := restoreTapFunc
+	oldOpen := openTapFdByNameFunc
 	oldListCubeVSTaps := cubevsListTAPDevices
 	oldListPortMappings := cubevsListPortMappings
 	oldAttach := cubevsAttachFilter
 	oldGetTap := cubevsGetTAPDevice
 	oldAddTap := cubevsAddTAPDevice
+	oldUpsert := cubevsUpsertTAPDevice
 	oldARP := addARPEntryFunc
 	oldRouteList := netlinkRouteListFiltered
 	oldRouteReplace := netlinkRouteReplace
 	t.Cleanup(func() {
 		listCubeTapsFunc = oldList
 		restoreTapFunc = oldRestore
+		openTapFdByNameFunc = oldOpen
 		cubevsListTAPDevices = oldListCubeVSTaps
 		cubevsListPortMappings = oldListPortMappings
 		cubevsAttachFilter = oldAttach
 		cubevsGetTAPDevice = oldGetTap
 		cubevsAddTAPDevice = oldAddTap
+		cubevsUpsertTAPDevice = oldUpsert
 		addARPEntryFunc = oldARP
 		netlinkRouteListFiltered = oldRouteList
 		netlinkRouteReplace = oldRouteReplace
@@ -587,11 +648,17 @@ func TestGetTapFileRestoresMissingFD(t *testing.T) {
 		tap.File = newTestTapFile(t)
 		return tap, nil
 	}
+	openCalls := 0
+	openTapFdByNameFunc = func(string) (*os.File, error) {
+		openCalls++
+		return newTestTapFile(t), nil
+	}
 	cubevsListTAPDevices = func() ([]cubevs.TAPDevice, error) { return nil, nil }
 	cubevsListPortMappings = func() (map[uint16]cubevs.MVMPort, error) { return map[uint16]cubevs.MVMPort{}, nil }
 	cubevsAttachFilter = func(uint32) error { return nil }
 	cubevsGetTAPDevice = func(uint32) (*cubevs.TAPDevice, error) { return &cubevs.TAPDevice{}, nil }
 	cubevsAddTAPDevice = func(uint32, net.IP, string, uint32, cubevs.MVMOptions) error { return nil }
+	cubevsUpsertTAPDevice = func(uint32, net.IP, string, uint32, cubevs.MVMOptions) error { return nil }
 	addARPEntryFunc = func(net.IP, string, int) error { return nil }
 	netlinkRouteListFiltered = func(_ int, _ *netlink.Route, _ uint64) ([]netlink.Route, error) { return nil, nil }
 	netlinkRouteReplace = func(_ *netlink.Route) error { return nil }
@@ -604,7 +671,7 @@ func TestGetTapFileRestoresMissingFD(t *testing.T) {
 		store:             store,
 		allocator:         allocator,
 		ports:             &portAllocator{},
-		cfg:               Config{CIDR: "192.168.0.0/18", MVMMacAddr: "20:90:6f:fc:fc:fc", MvmMtu: 1300},
+		cfg:               Config{CIDR: "192.168.0.0/18", MVMMacAddr: "20:90:6f:fc:fc:fc", MvmMtu: 1500},
 		cubeDev:           &cubeDev{Index: 16},
 		states:            make(map[string]*managedState),
 		destroyFailedTaps: make(map[string]*tapDevice),
@@ -613,15 +680,138 @@ func TestGetTapFileRestoresMissingFD(t *testing.T) {
 		t.Fatalf("recover error=%v", err)
 	}
 	svc.states["sandbox-1"].tap.File = nil
-	file, err := svc.GetTapFile("sandbox-1", "z192.168.0.3")
+	file, ifindex, err := svc.GetTapFile("sandbox-1", "z192.168.0.3")
 	if err != nil {
 		t.Fatalf("GetTapFile error=%v", err)
 	}
 	if file == nil {
 		t.Fatal("GetTapFile returned nil file")
 	}
-	if restoreCalls < 2 {
-		t.Fatalf("restoreCalls=%d, want at least 2 (recover + on-demand reopen)", restoreCalls)
+	if ifindex != 13 {
+		t.Fatalf("ifindex=%d, want 13", ifindex)
+	}
+	// recover() does the full restore once; the on-demand reopen of an idle,
+	// already-configured managed tap takes the cheap openTapFdByName path and
+	// must NOT trigger another full restoreTap.
+	if restoreCalls != 1 {
+		t.Fatalf("restoreCalls=%d, want 1 (recover only)", restoreCalls)
+	}
+	if openCalls != 1 {
+		t.Fatalf("openCalls=%d, want 1 (on-demand reopen)", openCalls)
+	}
+}
+
+// TestGetTapFileHotPathOpenFailureSelfHeals asserts that when the cheap reopen
+// (openTapFdByName) fails transiently, GetTapFile does NOT propagate the error
+// but falls through to the restoreTap recovery path, which re-validates and
+// retries fd acquisition so the sandbox create self-heals.
+func TestGetTapFileHotPathOpenFailureSelfHeals(t *testing.T) {
+	oldList := listCubeTapsFunc
+	oldRestore := restoreTapFunc
+	oldOpen := openTapFdByNameFunc
+	oldListCubeVSTaps := cubevsListTAPDevices
+	oldListPortMappings := cubevsListPortMappings
+	oldAttach := cubevsAttachFilter
+	oldGetTap := cubevsGetTAPDevice
+	oldAddTap := cubevsAddTAPDevice
+	oldUpsert := cubevsUpsertTAPDevice
+	oldARP := addARPEntryFunc
+	oldRouteList := netlinkRouteListFiltered
+	oldRouteReplace := netlinkRouteReplace
+	t.Cleanup(func() {
+		listCubeTapsFunc = oldList
+		restoreTapFunc = oldRestore
+		openTapFdByNameFunc = oldOpen
+		cubevsListTAPDevices = oldListCubeVSTaps
+		cubevsListPortMappings = oldListPortMappings
+		cubevsAttachFilter = oldAttach
+		cubevsGetTAPDevice = oldGetTap
+		cubevsAddTAPDevice = oldAddTap
+		cubevsUpsertTAPDevice = oldUpsert
+		addARPEntryFunc = oldARP
+		netlinkRouteListFiltered = oldRouteList
+		netlinkRouteReplace = oldRouteReplace
+	})
+
+	store, err := newStateStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("newStateStore error=%v", err)
+	}
+	persisted := &persistedState{
+		SandboxID:     "sandbox-1",
+		NetworkHandle: "sandbox-1",
+		TapName:       "z192.168.0.3",
+		TapIfIndex:    13,
+		SandboxIP:     "192.168.0.3",
+	}
+	if err := store.Save(persisted); err != nil {
+		t.Fatalf("store.Save error=%v", err)
+	}
+
+	listCubeTapsFunc = func() (map[string]*tapDevice, error) {
+		return map[string]*tapDevice{
+			"192.168.0.3": {
+				Name:  "z192.168.0.3",
+				Index: 13,
+				IP:    net.ParseIP("192.168.0.3").To4(),
+			},
+		}, nil
+	}
+	restoreCalls := 0
+	restoreTapFunc = func(tap *tapDevice, _ int, _ string, _ int) (*tapDevice, error) {
+		restoreCalls++
+		tap.File = newTestTapFile(t)
+		return tap, nil
+	}
+	openCalls := 0
+	openTapFdByNameFunc = func(string) (*os.File, error) {
+		openCalls++
+		return nil, fmt.Errorf("device or resource busy")
+	}
+	cubevsListTAPDevices = func() ([]cubevs.TAPDevice, error) { return nil, nil }
+	cubevsListPortMappings = func() (map[uint16]cubevs.MVMPort, error) { return map[uint16]cubevs.MVMPort{}, nil }
+	cubevsAttachFilter = func(uint32) error { return nil }
+	cubevsGetTAPDevice = func(uint32) (*cubevs.TAPDevice, error) { return &cubevs.TAPDevice{}, nil }
+	cubevsAddTAPDevice = func(uint32, net.IP, string, uint32, cubevs.MVMOptions) error { return nil }
+	cubevsUpsertTAPDevice = func(uint32, net.IP, string, uint32, cubevs.MVMOptions) error { return nil }
+	addARPEntryFunc = func(net.IP, string, int) error { return nil }
+	netlinkRouteListFiltered = func(_ int, _ *netlink.Route, _ uint64) ([]netlink.Route, error) { return nil, nil }
+	netlinkRouteReplace = func(_ *netlink.Route) error { return nil }
+
+	allocator, err := newIPAllocator("192.168.0.0/18")
+	if err != nil {
+		t.Fatalf("newIPAllocator error=%v", err)
+	}
+	svc := &localService{
+		store:             store,
+		allocator:         allocator,
+		ports:             &portAllocator{},
+		cfg:               Config{CIDR: "192.168.0.0/18", MVMMacAddr: "20:90:6f:fc:fc:fc", MvmMtu: 1500},
+		cubeDev:           &cubeDev{Index: 16},
+		states:            make(map[string]*managedState),
+		destroyFailedTaps: make(map[string]*tapDevice),
+	}
+	if err := svc.recover(); err != nil {
+		t.Fatalf("recover error=%v", err)
+	}
+	svc.states["sandbox-1"].tap.File = nil
+	file, ifindex, err := svc.GetTapFile("sandbox-1", "z192.168.0.3")
+	if err != nil {
+		t.Fatalf("GetTapFile error=%v", err)
+	}
+	if file == nil {
+		t.Fatal("GetTapFile returned nil file")
+	}
+	if ifindex != 13 {
+		t.Fatalf("ifindex=%d, want 13", ifindex)
+	}
+	if openCalls != 1 {
+		t.Fatalf("openCalls=%d, want 1 (one failed fast-reopen attempt)", openCalls)
+	}
+	// recover() restores once; the failed fast reopen must fall through to a
+	// second restoreTap instead of propagating the error.
+	if restoreCalls != 2 {
+		t.Fatalf("restoreCalls=%d, want 2 (recover + self-heal fallback)", restoreCalls)
 	}
 }
 
@@ -683,3 +873,5 @@ func newTestTapFile(t *testing.T) *os.File {
 }
 
 func boolPtr(v bool) *bool { return &v }
+
+func stringPtr(v string) *string { return &v }

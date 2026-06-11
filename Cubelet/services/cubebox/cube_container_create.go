@@ -185,6 +185,17 @@ func (l *local) createContainers(ctx context.Context, flowOpts *workflow.CreateC
 	}
 
 	l.storeNumaQueues(ctx, sandBox, flowOpts)
+	if snapshotID, ok := flowOpts.GetSnapshotTemplateID(); ok && flowOpts.IsRetoreSnapshot() {
+		now := time.Now().UTC()
+		setRuntimeSnapshotBindingLabels(sandBox, snapshotID, now)
+		// Also stamp the restore-base label. Commit will advance the
+		// runtime-snapshot binding above; this label stays pinned at the
+		// memory image the VM was actually restored from, so the
+		// pagemap_anon fallback in CommitSandbox can still locate a
+		// reflinkable base after the most recent commit's snapshot is
+		// deleted.
+		setRuntimeRestoreBaseLabels(sandBox, snapshotID, now)
+	}
 
 	cgInfo, cgSet := flowOpts.CgroupInfo.(*cgroupp.Info)
 	if cgSet {
@@ -399,6 +410,7 @@ func (l *local) genImageReferenceForCubebox(ctx context.Context, flowOpts *workf
 }
 
 func (l *local) createCubeboxContainer(ctx context.Context, flowOpts *workflow.CreateContext, realReq *cubebox.RunCubeSandboxRequest, sandBox *cubeboxstore.CubeBox) error {
+	sandBox.Volumes = cloneVolumesToSave(realReq.GetVolumes())
 	for i, cntrReq := range realReq.Containers {
 		isPod := i == 0
 		_, cid := l.generateContainerID(ctx, flowOpts, i)
@@ -609,7 +621,7 @@ func WithCubeFsAnnotation(ctx context.Context,
 	if err != nil {
 		return nil, ret.Errorf(errorcode.ErrorCode_InvalidParamFormat, "generate virtiofs config failed: %v", err)
 	}
-	limit, err := workflow.GetQosFromReq(realReq)
+	limit, err := workflow.GetQosFromReq(realReq, constants.MasterAnnotationsFSQos)
 	if err != nil {
 		return nil, err
 	}

@@ -19,6 +19,7 @@ import (
 	"github.com/tencentcloud/CubeSandbox/Cubelet/plugins/cube/internals/metric/types"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/plugins/workflow"
 	"github.com/tencentcloud/CubeSandbox/cubelog"
+	"k8s.io/apimachinery/pkg/util/wait"
 )
 
 type Config struct {
@@ -94,6 +95,8 @@ func init() {
 			}
 			l.HostId = identity.InstanceID
 
+			initPrometheusMetrics(l.register, l.workflowEngine)
+
 			rt := &CubeLog.RequestTrace{
 				Action:    "Metric",
 				Timestamp: time.Time{},
@@ -114,6 +117,10 @@ func (l *Plugin) ReportCLS(ctx context.Context) {
 		CubeLog.WithContext(ctx).Errorf("parse duration err:%v", err)
 		return
 	}
+	if t <= 0 {
+		CubeLog.WithContext(ctx).Errorf("invalid cls report interval: %v, must be positive", t)
+		return
+	}
 
 	jobs := l.register.Get(types.MetricTypeCLS)
 	CubeLog.WithContext(ctx).Infof("There are %v cls metric jobs", len(jobs))
@@ -121,9 +128,7 @@ func (l *Plugin) ReportCLS(ctx context.Context) {
 		return
 	}
 
-	ticker := time.NewTicker(t)
-	defer ticker.Stop()
-	for range ticker.C {
+	report := func(ctx context.Context) {
 		clusterLabel := getClusterLabel()
 		for _, job := range jobs {
 			metricValue, err := func() (any, error) {
@@ -146,6 +151,22 @@ func (l *Plugin) ReportCLS(ctx context.Context) {
 				CubeLog.Trace(traceV)
 			}
 		}
+	}
+
+	// Wait before every report, including the first one, to avoid synchronized
+	// CLS metric bursts when many Cubelet instances start at the same time.
+	timer := time.NewTimer(wait.Jitter(t, 0.5))
+	defer timer.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			CubeLog.WithContext(ctx).Infof("cls metric report loop stopped: %v", ctx.Err())
+			return
+		case <-timer.C:
+		}
+		report(ctx)
+		timer.Reset(wait.Jitter(t, 0.5))
 	}
 }
 

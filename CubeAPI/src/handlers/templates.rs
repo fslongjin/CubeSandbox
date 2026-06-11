@@ -1,57 +1,91 @@
-// Copyright (c) 2024 Tencent Inc.
+// Copyright (c) 2026 Tencent Inc.
 // SPDX-License-Identifier: Apache-2.0
 //
 
-/// Template handlers — not implemented yet.
-///
-/// All endpoints return HTTP 501 Not Implemented.
-/// The route definitions are retained so the API surface is stable.
+//! Template handlers — thin forwarder to CubeMaster `/cube/template*` endpoints.
+
 use axum::{
     extract::{Path, Query, State},
+    http::{HeaderMap, HeaderValue, StatusCode},
     response::IntoResponse,
+    Json,
 };
 use serde::Deserialize;
 
 use crate::{
     error::{AppError, AppResult},
+    models::{
+        ApiError, CreateTemplateRequest, ListTemplatesQuery, RebuildTemplateRequest,
+        TemplateDetail, TemplateSummary,
+    },
     state::AppState,
 };
 
-const NOT_IMPLEMENTED_MSG: &str =
-    "Template API is not yet implemented. See docs/cubemaster-api-requirements.md.";
-
 // ─── GET /templates ───────────────────────────────────────────────────────────
 
-pub async fn list_templates(State(_): State<AppState>) -> AppResult<impl IntoResponse> {
-    Err::<(), _>(AppError::NotImplemented(NOT_IMPLEMENTED_MSG.to_string()))
+#[utoipa::path(
+    get,
+    path = "/templates",
+    params(ListTemplatesQuery),
+    responses(
+        (status = 200, description = "Template list", body = [TemplateSummary]),
+        (status = 404, description = "Template endpoint unavailable", body = ApiError),
+        (status = 500, description = "Unexpected backend error", body = ApiError)
+    )
+)]
+pub async fn list_templates(
+    State(state): State<AppState>,
+    Query(_params): Query<ListTemplatesQuery>,
+) -> AppResult<impl IntoResponse> {
+    let items = state.services.templates.list_templates().await?;
+    Ok((StatusCode::OK, Json(items)))
 }
 
 // ─── GET /templates/:templateID ───────────────────────────────────────────────
 
+#[utoipa::path(
+    get,
+    path = "/templates/{templateID}",
+    params(
+        ("templateID" = String, Path, description = "Template identifier")
+    ),
+    responses(
+        (status = 200, description = "Template detail", body = TemplateDetail),
+        (status = 404, description = "Template not found", body = ApiError),
+        (status = 500, description = "Unexpected backend error", body = ApiError)
+    )
+)]
 pub async fn get_template(
-    State(_): State<AppState>,
-    Path(_template_id): Path<String>,
+    State(state): State<AppState>,
+    Path(template_id): Path<String>,
 ) -> AppResult<impl IntoResponse> {
-    Err::<(), _>(AppError::NotImplemented(NOT_IMPLEMENTED_MSG.to_string()))
+    let detail = state.services.templates.get_template(&template_id).await?;
+    Ok((StatusCode::OK, Json(detail)))
 }
 
 // ─── POST /templates ──────────────────────────────────────────────────────────
 
 pub async fn create_template(
-    State(_): State<AppState>,
-    _body: axum::extract::Json<serde_json::Value>,
+    State(state): State<AppState>,
+    Json(body): Json<CreateTemplateRequest>,
 ) -> AppResult<impl IntoResponse> {
-    Err::<(), _>(AppError::NotImplemented(NOT_IMPLEMENTED_MSG.to_string()))
+    let job = state.services.templates.create_template(body).await?;
+    Ok((StatusCode::ACCEPTED, Json(job)))
 }
 
 // ─── POST /templates/:templateID (rebuild) ────────────────────────────────────
 
 pub async fn rebuild_template(
-    State(_): State<AppState>,
-    Path(_template_id): Path<String>,
-    _body: axum::extract::Json<serde_json::Value>,
+    State(state): State<AppState>,
+    Path(template_id): Path<String>,
+    Json(body): Json<RebuildTemplateRequest>,
 ) -> AppResult<impl IntoResponse> {
-    Err::<(), _>(AppError::NotImplemented(NOT_IMPLEMENTED_MSG.to_string()))
+    let job = state
+        .services
+        .templates
+        .rebuild_template(template_id, body)
+        .await?;
+    Ok((StatusCode::ACCEPTED, Json(job)))
 }
 
 // ─── PATCH /templates/:templateID ─────────────────────────────────────────────
@@ -59,27 +93,67 @@ pub async fn rebuild_template(
 pub async fn update_template(
     State(_): State<AppState>,
     Path(_template_id): Path<String>,
-    _body: axum::extract::Json<serde_json::Value>,
+    _body: Json<serde_json::Value>,
 ) -> AppResult<impl IntoResponse> {
-    Err::<(), _>(AppError::NotImplemented(NOT_IMPLEMENTED_MSG.to_string()))
+    // CubeMaster exposes no dedicated PATCH; clients should use POST
+    // /templates/:id (rebuild) or DELETE + re-create.
+    Err::<(), _>(AppError::NotImplemented(
+        "template metadata update is not supported; use POST /templates/{id} to rebuild"
+            .to_string(),
+    ))
 }
 
 // ─── DELETE /templates/:templateID ────────────────────────────────────────────
 
+#[derive(Debug, Deserialize, Default)]
+pub struct DeleteTemplateQuery {
+    #[serde(default)]
+    pub instance_type: Option<String>,
+    #[serde(default)]
+    pub sync: Option<bool>,
+}
+
 pub async fn delete_template(
-    State(_): State<AppState>,
-    Path(_template_id): Path<String>,
+    State(state): State<AppState>,
+    Path(template_id): Path<String>,
+    Query(params): Query<DeleteTemplateQuery>,
 ) -> AppResult<impl IntoResponse> {
-    Err::<(), _>(AppError::NotImplemented(NOT_IMPLEMENTED_MSG.to_string()))
+    // Both branches return `204 No Content` so callers see a single, REST-
+    // conventional response shape regardless of whether `templateID`
+    // resolves to a snapshot or a regular template (Bug 2).  The snapshot
+    // branch additionally exposes the operation id via a response header so
+    // audit trails / debugging can still correlate the deletion with its
+    // CubeMaster job, but no body is returned.
+    if state.services.snapshots.has_snapshot(&template_id).await? {
+        let resp = state.services.snapshots.delete(&template_id).await?;
+        let mut headers = HeaderMap::new();
+        if let Ok(value) = HeaderValue::from_str(&resp.operation_id) {
+            headers.insert("x-operation-id", value);
+        }
+        return Ok((StatusCode::NO_CONTENT, headers).into_response());
+    }
+
+    state
+        .services
+        .templates
+        .delete_template(template_id, params.instance_type, params.sync)
+        .await?;
+
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 // ─── POST /templates/:templateID/builds/:buildID ──────────────────────────────
 
 pub async fn start_template_build(
-    State(_): State<AppState>,
-    Path((_template_id, _build_id)): Path<(String, String)>,
+    State(state): State<AppState>,
+    Path((template_id, _build_id)): Path<(String, String)>,
 ) -> AppResult<impl IntoResponse> {
-    Err::<(), _>(AppError::NotImplemented(NOT_IMPLEMENTED_MSG.to_string()))
+    let job = state
+        .services
+        .templates
+        .start_template_build(template_id)
+        .await?;
+    Ok((StatusCode::ACCEPTED, Json(job)))
 }
 
 // ─── GET /templates/:templateID/builds/:buildID/status ────────────────────────
@@ -92,11 +166,16 @@ pub struct BuildStatusQuery {
 }
 
 pub async fn get_template_build_status(
-    State(_): State<AppState>,
-    Path((_template_id, _build_id)): Path<(String, String)>,
+    State(state): State<AppState>,
+    Path((template_id, build_id)): Path<(String, String)>,
     Query(_params): Query<BuildStatusQuery>,
 ) -> AppResult<impl IntoResponse> {
-    Err::<(), _>(AppError::NotImplemented(NOT_IMPLEMENTED_MSG.to_string()))
+    let out = state
+        .services
+        .templates
+        .get_template_build_status(&template_id, &build_id)
+        .await?;
+    Ok((StatusCode::OK, Json(out)))
 }
 
 // ─── GET /templates/:templateID/builds/:buildID/logs ─────────────────────────
@@ -115,9 +194,14 @@ fn default_log_limit() -> i32 {
 }
 
 pub async fn get_template_build_logs(
-    State(_): State<AppState>,
-    Path((_template_id, _build_id)): Path<(String, String)>,
+    State(state): State<AppState>,
+    Path((_template_id, build_id)): Path<(String, String)>,
     Query(_params): Query<BuildLogsQuery>,
 ) -> AppResult<impl IntoResponse> {
-    Err::<(), _>(AppError::NotImplemented(NOT_IMPLEMENTED_MSG.to_string()))
+    let logs = state
+        .services
+        .templates
+        .get_template_build_logs(&build_id)
+        .await?;
+    Ok((StatusCode::OK, Json(logs)))
 }

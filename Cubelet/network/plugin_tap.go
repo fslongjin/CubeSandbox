@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"os"
 	"strings"
 	"sync"
@@ -24,7 +25,6 @@ import (
 	"github.com/tencentcloud/CubeSandbox/Cubelet/api/services/errorcode/v1"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/internal/tomlext"
 	. "github.com/tencentcloud/CubeSandbox/Cubelet/network/proto"
-	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/allocator"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/constants"
 	localnetfile "github.com/tencentcloud/CubeSandbox/Cubelet/pkg/container/netfile"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/log"
@@ -33,7 +33,7 @@ import (
 	networkstore "github.com/tencentcloud/CubeSandbox/Cubelet/pkg/store/network"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/utils"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/plugins/workflow"
-	"github.com/tencentcloud/CubeSandbox/cubelog"
+	CubeLog "github.com/tencentcloud/CubeSandbox/cubelog"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 	"google.golang.org/grpc/codes"
@@ -41,11 +41,7 @@ import (
 )
 
 var (
-	ErrNotRangeIP = errors.New("NotRangeIP")
-
 	ErrNotCubeTap = errors.New("NotCubeTap")
-
-	ErrIPExhausted = errors.New("IP exhausted")
 
 	ErrInvalidParams = errors.New("invalid network params")
 )
@@ -253,26 +249,19 @@ func extractIP(name string) (string, error) {
 
 var (
 	Name2MvmNet sync.Map
-	CfgAppMark  string
-
-	tapVersion uint32 = 0
 )
 
 type Config struct {
-	EthName             string   `toml:"eth_name"`
-	TapInitNum          int      `toml:"tap_init_num"`
-	CIDR                string   `toml:"cidr"`
-	ObjectDir           string   `toml:"object_dir"`
-	MVMInnerIP          string   `toml:"mvm_inner_ip"`
-	MVMMacAddr          string   `toml:"mvm_mac_addr"`
-	MvmGwDestIP         string   `toml:"mvm_gw_dest_ip"`
-	MvmGwMacAddr        string   `toml:"mvm_gw_mac_addr"`
-	MvmMask             int      `toml:"mvm_mask"`
-	MvmMtu              int      `toml:"mvm_mtu"`
-	DisableTso          bool     `toml:"disable_tso"`
-	DisableUfo          bool     `toml:"disable_ufo"`
-	DisableCheckSum     bool     `toml:"disable_check_sum"`
-	DefaultExposedPorts []uint16 `toml:"default_exposed_ports"`
+	EthName      string `toml:"eth_name"`
+	TapInitNum   int    `toml:"tap_init_num"`
+	CIDR         string `toml:"cidr"`
+	ObjectDir    string `toml:"object_dir"`
+	MVMInnerIP   string `toml:"mvm_inner_ip"`
+	MVMMacAddr   string `toml:"mvm_mac_addr"`
+	MvmGwDestIP  string `toml:"mvm_gw_dest_ip"`
+	MvmGwMacAddr string `toml:"mvm_gw_mac_addr"`
+	MvmMask      int    `toml:"mvm_mask"`
+	MvmMtu       int    `toml:"mvm_mtu"`
 
 	CheckIntervalTime      tomlext.Duration `toml:"check_interval_in_sec"`
 	ReportStatIntervalTime tomlext.Duration `toml:"report_stat_interval_in_sec"`
@@ -291,14 +280,13 @@ type Config struct {
 	NetworkAgentTapSocket     string           `toml:"network_agent_tap_socket"`
 	NetworkAgentInitTimeout   tomlext.Duration `toml:"network_agent_init_timeout"`
 	NetworkAgentRetryInterval tomlext.Duration `toml:"network_agent_retry_interval"`
+	NetworkAgentTapFDTimeout  tomlext.Duration `toml:"network_agent_tap_fd_timeout"`
 
 	ReconcileInterval tomlext.Duration `toml:"reconcile_interval"`
 }
 
 type local struct {
 	ID2MvmNet       sync.Map
-	allocator       *IPAllocator
-	portAllocator   allocator.Allocator[uint16]
 	Config          *Config
 	cubeDev         *CubeDev
 	Device          *MachineDevice
@@ -341,6 +329,9 @@ func initTapPlugin(ic *plugin.InitContext) (*local, error) {
 	if config.NetworkAgentRetryInterval == 0 {
 		config.NetworkAgentRetryInterval = tomlext.FromStdTime(time.Second)
 	}
+	if config.NetworkAgentTapFDTimeout == 0 {
+		config.NetworkAgentTapFDTimeout = tomlext.FromStdTime(2 * time.Second)
+	}
 
 	if config.MvmMask == 0 {
 		config.MvmMask = 30
@@ -355,10 +346,6 @@ func initTapPlugin(ic *plugin.InitContext) (*local, error) {
 		config.EthName = eth0
 	}
 
-	if len(config.DefaultExposedPorts) > 0 {
-		log.G(ic.Context).Errorf("set default exposed ports to %v", config.DefaultExposedPorts)
-		DefaultExposedPorts = config.DefaultExposedPorts
-	}
 	log.G(ic.Context).Info("network plugin init begin")
 
 	device, err := getMachineDevice(config.EthName)
@@ -366,20 +353,11 @@ func initTapPlugin(ic *plugin.InitContext) (*local, error) {
 		return nil, err
 	}
 	log.G(ic.Context).Info("network get node info done")
-	ipAllocator, err := NewAllocator(config.CIDR)
+	gwIP, mask, err := getGwIPAndMask(config.CIDR)
 	if err != nil {
 		return nil, err
 	}
-	log.G(ic.Context).Info("network ipam init done")
-
-	portAllocator, err := initPortAllocatorFromSysConfig()
-	if err != nil {
-		return nil, err
-	}
-	log.G(ic.Context).Info("network port allocator init done")
-
-	gwIP := ipAllocator.GatewayIP()
-	cubeDev, err := getOrNewCubeDev(gwIP, ipAllocator.mask, config.MvmMtu, config.MvmGwMacAddr)
+	cubeDev, err := getOrNewCubeDev(gwIP, mask, config.MvmMtu, config.MvmGwMacAddr)
 	if err != nil {
 		return nil, err
 	}
@@ -389,8 +367,6 @@ func initTapPlugin(ic *plugin.InitContext) (*local, error) {
 		Config:             config,
 		Device:             device,
 		cubeDev:            cubeDev,
-		allocator:          ipAllocator,
-		portAllocator:      portAllocator,
 		DestroyLocks:       utils.NewResourceLocks(),
 		networkAgentClient: networkagentclient.NewNoopClient(),
 	}
@@ -471,26 +447,46 @@ func (l *local) Create(ctx context.Context, opts *workflow.CreateContext) (err e
 		return ret.Errorf(errorcode.ErrorCode_InvalidParamFormat, "validate network params failed: %v", err)
 	}
 
-	cubeVSContextBeforeDNS := buildNetworkAgentCubeVSContext(request)
+	cubeNetworkConfigBeforeDNS := buildNetworkAgentCubeNetworkConfig(request)
 	resolvedDNSServers, err := localnetfile.ResolveEffectiveDNSServers(request)
 	if err != nil {
 		return ret.Errorf(errorcode.ErrorCode_InvalidParamFormat, "resolve effective dns servers failed: %v", err)
 	}
-	cubeVSContext, dnsAllowOutCIDRs := mergeDNSAllowOutCIDRs(cubeVSContextBeforeDNS, resolvedDNSServers)
+	cubeNetworkConfig, dnsAllowOutCIDRs := mergeDNSAllowOutCIDRs(cubeNetworkConfigBeforeDNS, resolvedDNSServers)
 
-	log.G(ctx).Infof("tap create using network-agent: sandbox_id=%s request_id=%s exposed_ports=%v req_version=%d allow_internet_access=%s allow_out=%d deny_out=%d resolved_dns_servers=%v dns_allow_out_cidrs=%v cubevs_context_before_dns_merge=%s cubevs_context=%s",
+	log.G(ctx).Infof("tap create using network-agent: sandbox_id=%s request_id=%s exposed_ports=%v req_version=%d allow_internet_access=%s allow_out=%d deny_out=%d resolved_dns_servers=%v dns_allow_out_cidrs=%v cube_network_config_before_dns_merge=%s cube_network_config=%s",
 		opts.SandboxID, request.GetRequestID(), request.ExposedPorts, req.Version,
-		formatCubeVSAllowInternetAccess(cubeVSContext), lenCubeVSList(cubeVSContext, true), lenCubeVSList(cubeVSContext, false),
-		resolvedDNSServers, dnsAllowOutCIDRs, formatNetworkAgentCubeVSContext(cubeVSContextBeforeDNS), formatNetworkAgentCubeVSContext(cubeVSContext))
-	ensureReq := l.buildEnsureNetworkRequestFromIntent(opts.SandboxID, request.GetRequestID(), request.ExposedPorts, req, cubeVSContext)
-	log.G(ctx).Infof("tap create ensure request: sandbox_id=%s interfaces=%d routes=%d arps=%d port_mappings=%d resolved_dns_servers=%v dns_allow_out_cidrs=%v cubevs_context=%s persist_metadata=%s",
+		formatCubeNetworkAllowInternetAccess(cubeNetworkConfig), lenCubeNetworkList(cubeNetworkConfig, true), lenCubeNetworkList(cubeNetworkConfig, false),
+		resolvedDNSServers, dnsAllowOutCIDRs, formatNetworkAgentCubeNetworkConfig(cubeNetworkConfigBeforeDNS), formatNetworkAgentCubeNetworkConfig(cubeNetworkConfig))
+	ensureReq := l.buildEnsureNetworkRequestFromIntent(opts.SandboxID, request.GetRequestID(), request.ExposedPorts, req, cubeNetworkConfig)
+	log.G(ctx).Infof("tap create ensure request: sandbox_id=%s interfaces=%d routes=%d arps=%d port_mappings=%d resolved_dns_servers=%v dns_allow_out_cidrs=%v cube_network_config=%s persist_metadata=%s",
 		ensureReq.SandboxID, len(ensureReq.Interfaces), len(ensureReq.Routes), len(ensureReq.ARPNeighbors),
-		len(ensureReq.PortMappings), resolvedDNSServers, dnsAllowOutCIDRs, formatNetworkAgentCubeVSContext(ensureReq.CubeVSContext), utils.InterfaceToString(ensureReq.PersistMetadata))
+		len(ensureReq.PortMappings), resolvedDNSServers, dnsAllowOutCIDRs, formatNetworkAgentCubeNetworkConfig(ensureReq.CubeNetworkConfig), utils.InterfaceToString(ensureReq.PersistMetadata))
 	ensureResp, naErr := l.networkAgentClient.EnsureNetwork(ctx, ensureReq)
 	if naErr != nil {
 		l.recordNetworkAgentFailure(naErr)
 		return ret.Errorf(errorcode.ErrorCode_CreateNetworkFailed, "network-agent EnsureNetwork failed: %s", classifyNetworkAgentError(naErr))
 	}
+
+	defer func() {
+		if err == nil {
+			return
+		}
+		// Use a detached context with a 15-second timeout to ensure rollback succeeds even if the parent context is cancelled, without hanging indefinitely.
+		rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+		defer cancel()
+		releaseReq := &networkagentclient.ReleaseNetworkRequest{
+			SandboxID:       opts.SandboxID,
+			NetworkHandle:   ensureResp.NetworkHandle,
+			IdempotencyKey:  ensureReq.IdempotencyKey,
+			PersistMetadata: ensureResp.PersistMetadata,
+		}
+		if rErr := l.networkAgentClient.ReleaseNetwork(rollbackCtx, releaseReq); rErr != nil {
+			log.G(rollbackCtx).Warnf("failed to release network during rollback for sandbox %s: %v", opts.SandboxID, rErr)
+		}
+		l.unregisterNetworkAgentTapForPool(rollbackCtx, opts.SandboxID)
+	}()
+
 	log.G(ctx).Infof("tap create ensure response: sandbox_id=%s network_handle=%s interfaces=%d routes=%d arps=%d port_mappings=%d persist_metadata=%s",
 		ensureResp.SandboxID, ensureResp.NetworkHandle, len(ensureResp.Interfaces), len(ensureResp.Routes),
 		len(ensureResp.ARPNeighbors), len(ensureResp.PortMappings), utils.InterfaceToString(ensureResp.PersistMetadata))
@@ -524,23 +520,24 @@ func (l *local) Create(ctx context.Context, opts *workflow.CreateContext) (err e
 	return nil
 }
 
-func buildNetworkAgentCubeVSContext(request *cubebox.RunCubeSandboxRequest) *networkagentclient.CubeVSContext {
+func buildNetworkAgentCubeNetworkConfig(request *cubebox.RunCubeSandboxRequest) *networkagentclient.CubeNetworkConfig {
 	if request == nil {
 		return nil
 	}
-	if request.GetCubevsContext() != nil {
-		return mapRunRequestCubeVSContext(request.GetCubevsContext())
+	if request.GetCubeNetworkConfig() != nil {
+		return mapRunRequestCubeNetworkConfig(request.GetCubeNetworkConfig())
 	}
-	return buildLegacyNetworkAgentCubeVSContext(request.GetAnnotations())
+	return buildLegacyNetworkAgentCubeNetworkConfig(request.GetAnnotations())
 }
 
-func mapRunRequestCubeVSContext(in *cubebox.CubeVSContext) *networkagentclient.CubeVSContext {
+func mapRunRequestCubeNetworkConfig(in *cubebox.CubeNetworkConfig) *networkagentclient.CubeNetworkConfig {
 	if in == nil {
 		return nil
 	}
-	out := &networkagentclient.CubeVSContext{
+	out := &networkagentclient.CubeNetworkConfig{
 		AllowOut: append([]string(nil), in.GetAllowOut()...),
 		DenyOut:  append([]string(nil), in.GetDenyOut()...),
+		Rules:    mapRunRequestEgressRules(in.GetRules()),
 	}
 	if in.AllowInternetAccess != nil {
 		allowInternetAccess := in.GetAllowInternetAccess()
@@ -549,64 +546,120 @@ func mapRunRequestCubeVSContext(in *cubebox.CubeVSContext) *networkagentclient.C
 	return out
 }
 
-func buildLegacyNetworkAgentCubeVSContext(annotations map[string]string) *networkagentclient.CubeVSContext {
+func mapRunRequestEgressRules(in []*cubebox.EgressRule) []*networkagentclient.EgressRule {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]*networkagentclient.EgressRule, 0, len(in))
+	for _, r := range in {
+		if r == nil {
+			continue
+		}
+		out = append(out, &networkagentclient.EgressRule{
+			Name:   r.GetName(),
+			Match:  mapRunRequestEgressRuleMatch(r.GetMatch()),
+			Action: mapRunRequestEgressRuleAction(r.GetAction()),
+		})
+	}
+	return out
+}
+
+func mapRunRequestEgressRuleMatch(in *cubebox.EgressRuleMatch) *networkagentclient.EgressRuleMatch {
+	if in == nil {
+		return nil
+	}
+	return &networkagentclient.EgressRuleMatch{
+		SNI:    in.Sni,
+		Host:   in.Host,
+		Method: append([]string(nil), in.GetMethod()...),
+		Path:   in.Path,
+		Scheme: in.Scheme,
+	}
+}
+
+func mapRunRequestEgressRuleAction(in *cubebox.EgressRuleAction) *networkagentclient.EgressRuleAction {
+	if in == nil {
+		return nil
+	}
+	out := &networkagentclient.EgressRuleAction{
+		Allow: in.GetAllow(),
+		Audit: in.Audit,
+	}
+	if len(in.GetInject()) > 0 {
+		out.Inject = make([]*networkagentclient.EgressRuleInject, 0, len(in.GetInject()))
+		for _, inj := range in.GetInject() {
+			if inj == nil {
+				continue
+			}
+			out.Inject = append(out.Inject, &networkagentclient.EgressRuleInject{
+				Header: inj.GetHeader(),
+				Secret: inj.GetSecret(),
+				Format: inj.Format,
+			})
+		}
+	}
+	return out
+}
+
+func buildLegacyNetworkAgentCubeNetworkConfig(annotations map[string]string) *networkagentclient.CubeNetworkConfig {
 	if len(annotations) == 0 {
 		return nil
 	}
 	if v, ok := annotations[constants.MasterAnnotationNetworkPolicyBlockAll]; ok && v == "true" {
 		allowInternetAccess := false
-		return &networkagentclient.CubeVSContext{AllowInternetAccess: &allowInternetAccess}
+		return &networkagentclient.CubeNetworkConfig{AllowInternetAccess: &allowInternetAccess}
 	}
 	if v, ok := annotations[constants.MasterAnnotationNetworkPolicyAllowPublicServices]; ok && v == "true" {
 		allowInternetAccess := true
-		return &networkagentclient.CubeVSContext{AllowInternetAccess: &allowInternetAccess}
+		return &networkagentclient.CubeNetworkConfig{AllowInternetAccess: &allowInternetAccess}
 	}
 	if v, ok := annotations[constants.MasterAnnotationNetworkPolicyDefault]; ok && v == "true" {
 		allowInternetAccess := true
-		return &networkagentclient.CubeVSContext{AllowInternetAccess: &allowInternetAccess}
+		return &networkagentclient.CubeNetworkConfig{AllowInternetAccess: &allowInternetAccess}
 	}
 	return nil
 }
 
-func formatCubeVSAllowInternetAccess(ctx *networkagentclient.CubeVSContext) string {
-	if ctx == nil || ctx.AllowInternetAccess == nil {
+func formatCubeNetworkAllowInternetAccess(cfg *networkagentclient.CubeNetworkConfig) string {
+	if cfg == nil || cfg.AllowInternetAccess == nil {
 		return "default(true)"
 	}
-	if *ctx.AllowInternetAccess {
+	if *cfg.AllowInternetAccess {
 		return "true"
 	}
 	return "false"
 }
 
-func lenCubeVSList(ctx *networkagentclient.CubeVSContext, allow bool) int {
-	if ctx == nil {
+func lenCubeNetworkList(cfg *networkagentclient.CubeNetworkConfig, allow bool) int {
+	if cfg == nil {
 		return 0
 	}
 	if allow {
-		return len(ctx.AllowOut)
+		return len(cfg.AllowOut)
 	}
-	return len(ctx.DenyOut)
+	return len(cfg.DenyOut)
 }
 
-func formatNetworkAgentCubeVSContext(ctx *networkagentclient.CubeVSContext) string {
-	if ctx == nil {
-		return "allow_internet_access=default(true) allow_out=[] deny_out=[]"
+func formatNetworkAgentCubeNetworkConfig(cfg *networkagentclient.CubeNetworkConfig) string {
+	if cfg == nil {
+		return "allow_internet_access=default(true) allow_out=[] deny_out=[] rules=0"
 	}
 	return fmt.Sprintf(
-		"allow_internet_access=%s allow_out=%v deny_out=%v",
-		formatCubeVSAllowInternetAccess(ctx),
-		ctx.AllowOut,
-		ctx.DenyOut,
+		"allow_internet_access=%s allow_out=%v deny_out=%v rules=%d",
+		formatCubeNetworkAllowInternetAccess(cfg),
+		cfg.AllowOut,
+		cfg.DenyOut,
+		len(cfg.Rules),
 	)
 }
 
-func mergeDNSAllowOutCIDRs(ctx *networkagentclient.CubeVSContext, dnsServers []string) (*networkagentclient.CubeVSContext, []string) {
-	if !shouldAppendDNSAllowOut(ctx) || len(dnsServers) == 0 {
-		return ctx, nil
+func mergeDNSAllowOutCIDRs(cfg *networkagentclient.CubeNetworkConfig, dnsServers []string) (*networkagentclient.CubeNetworkConfig, []string) {
+	if !shouldAppendDNSAllowOut(cfg) || len(dnsServers) == 0 {
+		return cfg, nil
 	}
-	out := cloneNetworkAgentCubeVSContext(ctx)
+	out := cloneNetworkAgentCubeNetworkConfig(cfg)
 	if out == nil {
-		out = &networkagentclient.CubeVSContext{}
+		out = &networkagentclient.CubeNetworkConfig{}
 	}
 	dnsAllowOutCIDRs := make([]string, 0, len(dnsServers))
 	for _, dnsServer := range dnsServers {
@@ -620,26 +673,151 @@ func mergeDNSAllowOutCIDRs(ctx *networkagentclient.CubeVSContext, dnsServers []s
 	return out, dnsAllowOutCIDRs
 }
 
-func shouldAppendDNSAllowOut(ctx *networkagentclient.CubeVSContext) bool {
-	if ctx == nil {
+func shouldAppendDNSAllowOut(cfg *networkagentclient.CubeNetworkConfig) bool {
+	if cfg == nil {
 		return false
 	}
-	if ctx.AllowInternetAccess != nil && !*ctx.AllowInternetAccess {
-		return true
+	if cfg.AllowInternetAccess != nil && !*cfg.AllowInternetAccess {
+		return false
 	}
-	return len(ctx.AllowOut) > 0 || len(ctx.DenyOut) > 0
+	for _, target := range cfg.AllowOut {
+		if isAllowOutDomainTarget(target) {
+			return true
+		}
+	}
+	return hasL7DomainRuleTarget(cfg.Rules)
 }
 
-func cloneNetworkAgentCubeVSContext(ctx *networkagentclient.CubeVSContext) *networkagentclient.CubeVSContext {
-	if ctx == nil {
+func isAllowOutDomainTarget(raw string) bool {
+	target := strings.TrimSpace(raw)
+	if target == "" {
+		return false
+	}
+	if isIPv4NetworkTarget(target) {
+		return false
+	}
+	if strings.Contains(target, "/") {
+		return false
+	}
+	if net.ParseIP(target) != nil || isDottedDecimalLikeTarget(target) {
+		return false
+	}
+	return isDNSAllowDomainTarget(target)
+}
+
+func hasL7DomainRuleTarget(rules []*networkagentclient.EgressRule) bool {
+	for _, rule := range rules {
+		if rule == nil || rule.Match == nil {
+			continue
+		}
+		if rule.Match.SNI != nil && isL7DomainTarget(*rule.Match.SNI) {
+			return true
+		}
+		if rule.Match.Host != nil && isL7HostDomainTarget(*rule.Match.Host) {
+			return true
+		}
+	}
+	return false
+}
+
+func isL7HostDomainTarget(raw string) bool {
+	target := strings.TrimSpace(raw)
+	if target == "" {
+		return false
+	}
+	if host, _, err := net.SplitHostPort(target); err == nil {
+		target = host
+	}
+	if net.ParseIP(target) != nil {
+		return false
+	}
+	if strings.Contains(target, "/") {
+		return false
+	}
+	if isDottedDecimalLikeTarget(target) {
+		return false
+	}
+	return isL7DomainTarget(target)
+}
+
+func isL7DomainTarget(raw string) bool {
+	domain := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(raw), "."))
+	if isDottedDecimalLikeTarget(domain) {
+		return false
+	}
+	return isValidDNSDomainTarget(domain)
+}
+
+func isIPv4NetworkTarget(target string) bool {
+	if strings.Contains(target, "/") {
+		ip, _, err := net.ParseCIDR(target)
+		return err == nil && ip.To4() != nil
+	}
+	ip := net.ParseIP(target)
+	return ip != nil && ip.To4() != nil
+}
+
+func isDottedDecimalLikeTarget(target string) bool {
+	parts := strings.Split(strings.TrimSuffix(target, "."), ".")
+	if len(parts) != net.IPv4len {
+		return false
+	}
+	for _, part := range parts {
+		if part == "" {
+			return false
+		}
+		for _, ch := range part {
+			if ch < '0' || ch > '9' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func isDNSAllowDomainTarget(target string) bool {
+	domain := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(target), "."))
+	return isValidDNSDomainTarget(domain)
+}
+
+func isValidDNSDomainTarget(domain string) bool {
+	if domain == "" || len(domain) >= 254 {
+		return false
+	}
+	if strings.HasPrefix(domain, "*.") {
+		domain = domain[2:]
+	} else if strings.Contains(domain, "*") {
+		return false
+	}
+	labels := strings.Split(domain, ".")
+	for _, label := range labels {
+		if label == "" || len(label) > 63 {
+			return false
+		}
+		for i, ch := range label {
+			isAlphaNum := (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9')
+			if !isAlphaNum && ch != '-' {
+				return false
+			}
+			if ch == '-' && (i == 0 || i == len(label)-1) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func cloneNetworkAgentCubeNetworkConfig(cfg *networkagentclient.CubeNetworkConfig) *networkagentclient.CubeNetworkConfig {
+	if cfg == nil {
 		return nil
 	}
-	out := &networkagentclient.CubeVSContext{
-		AllowOut: append([]string(nil), ctx.AllowOut...),
-		DenyOut:  append([]string(nil), ctx.DenyOut...),
+	out := &networkagentclient.CubeNetworkConfig{
+		AllowOut: append([]string(nil), cfg.AllowOut...),
+		DenyOut:  append([]string(nil), cfg.DenyOut...),
+		Rules:    cfg.Rules,
 	}
-	if ctx.AllowInternetAccess != nil {
-		v := *ctx.AllowInternetAccess
+	if cfg.AllowInternetAccess != nil {
+		v := *cfg.AllowInternetAccess
 		out.AllowInternetAccess = &v
 	}
 	return out
@@ -653,7 +831,7 @@ func dnsServerToCIDR(ip string) (string, bool) {
 	if ipv4 := parsedIP.To4(); ipv4 != nil {
 		return ipv4.String() + "/32", true
 	}
-	return parsedIP.String() + "/128", true
+	return "", false
 }
 
 func appendUniqueString(base []string, extra []string) []string {
@@ -676,69 +854,6 @@ func appendUniqueString(base []string, extra []string) []string {
 		out = append(out, item)
 	}
 	return out
-}
-
-func (l *local) generateShimNetReq(req *NetRequest, tap *Tap) (*ShimNetReq, error) {
-	shimReq := &ShimNetReq{
-		Interfaces: []*Interface{
-			{
-				Name:      tap.Name,
-				IPAddr:    tap.IP,
-				GuestName: eth0,
-				Mac:       l.Config.MVMMacAddr,
-
-				IP: l.Config.MVMInnerIP,
-
-				Family: 0,
-
-				Mask: l.Config.MvmMask,
-				IPs: []MVMIp{
-					{
-						IP:     l.Config.MVMInnerIP,
-						Mask:   l.Config.MvmMask,
-						Family: 0,
-					},
-				},
-				Mtu:             l.Config.MvmMtu,
-				DisableCheckSum: l.Config.DisableCheckSum,
-				DisableTso:      l.Config.DisableTso,
-				DisableUfo:      l.Config.DisableUfo,
-			},
-		},
-		Routes: []Route{
-			{
-				Family:  0,
-				Gateway: l.Config.MvmGwDestIP,
-				Source:  l.Config.MVMInnerIP,
-				Device:  eth0,
-				Scope:   0,
-			},
-		},
-		ARPs: []ARP{
-			{
-				DestIP: l.Config.MvmGwDestIP,
-				Device: eth0,
-				LlAddr: l.Config.MvmGwMacAddr,
-				State:  0,
-				Flags:  0,
-			},
-		},
-		PortMappings: tap.GetPortMappings(),
-	}
-	if req.Qos != nil {
-		bandwidthQos := req.Qos.BandWidth
-		opsQos := req.Qos.OPS
-		shimReq.Interfaces[0].Qos = &QosConfig{
-			BwSize:          bandwidthQos.Size,
-			BwOneTimeBurst:  bandwidthQos.OneTimeBurst,
-			BwRefillTime:    bandwidthQos.RefillTime,
-			OpsSize:         opsQos.Size,
-			OpsOneTimeBurst: opsQos.OneTimeBurst,
-			OpsRefillTime:   opsQos.RefillTime,
-		}
-	}
-
-	return shimReq, nil
 }
 
 func (l *local) Destroy(ctx context.Context, opts *workflow.DestroyContext) error {
@@ -821,7 +936,7 @@ func (l *local) CleanUp(ctx context.Context, opts *workflow.CleanContext) error 
 	return nil
 }
 
-func (l *local) buildEnsureNetworkRequestFromIntent(sandboxID, requestID string, exposedPorts []int64, shimReq *NetRequest, cubeVSContext *networkagentclient.CubeVSContext) *networkagentclient.EnsureNetworkRequest {
+func (l *local) buildEnsureNetworkRequestFromIntent(sandboxID, requestID string, exposedPorts []int64, shimReq *NetRequest, cubeNetworkConfig *networkagentclient.CubeNetworkConfig) *networkagentclient.EnsureNetworkRequest {
 	desired := &networkagentclient.EnsureNetworkRequest{
 		SandboxID:      sandboxID,
 		IdempotencyKey: requestID,
@@ -847,13 +962,10 @@ func (l *local) buildEnsureNetworkRequestFromIntent(sandboxID, requestID string,
 			},
 		},
 	}
-	desired.CubeVSContext = cubeVSContext
+	desired.CubeNetworkConfig = cubeNetworkConfig
 	portReq := make(map[uint16]struct{})
 	for _, port := range exposedPorts {
 		portReq[uint16(port)] = struct{}{}
-	}
-	for _, port := range DefaultExposedPorts {
-		portReq[port] = struct{}{}
 	}
 	for reqPort := range portReq {
 		desired.PortMappings = append(desired.PortMappings, networkagentclient.PortMapping{
@@ -905,18 +1017,15 @@ func (l *local) buildShimNetReqFromEnsureResponse(resp *networkagentclient.Ensur
 	shimReq := &ShimNetReq{
 		Interfaces: []*Interface{
 			{
-				Name:            intf.Name,
-				IPAddr:          sandboxIP,
-				GuestName:       eth0,
-				Mac:             intf.MAC,
-				Mtu:             int(intf.MTU),
-				IP:              legacyIP,
-				Family:          0,
-				Mask:            legacyMask,
-				IPs:             mvmIPs,
-				DisableCheckSum: l.Config.DisableCheckSum,
-				DisableTso:      l.Config.DisableTso,
-				DisableUfo:      l.Config.DisableUfo,
+				Name:      intf.Name,
+				IPAddr:    sandboxIP,
+				GuestName: eth0,
+				Mac:       intf.MAC,
+				Mtu:       int(intf.MTU),
+				IP:        legacyIP,
+				Family:    0,
+				Mask:      legacyMask,
+				IPs:       mvmIPs,
 			},
 		},
 	}
@@ -1053,17 +1162,25 @@ func (l *local) registerNetworkAgentTapForPool(ctx context.Context, sandboxID st
 	if intf.IPAddr == nil {
 		return fmt.Errorf("shim network sandbox ip is empty")
 	}
-	file, err := requestNetworkAgentTapFile(l.Config.NetworkAgentTapSocket, sandboxID, intf.Name)
+	tapFDTimeout := time.Duration(l.Config.NetworkAgentTapFDTimeout)
+	file, ifindex, err := requestNetworkAgentTapFile(l.Config.NetworkAgentTapSocket, sandboxID, intf.Name, tapFDTimeout)
 	if err != nil {
 		return fmt.Errorf("request original tap fd for %s: %w", intf.Name, err)
 	}
-	link, err := netlink.LinkByName(intf.Name)
-	if err != nil {
-		_ = file.Close()
-		return fmt.Errorf("lookup tap link %s: %w", intf.Name, err)
+	// network-agent returns the tap's kernel ifindex alongside the fd, so we can
+	// skip a netlink LinkByName here (an rtnl read that serialises with every
+	// other concurrent sandbox create). Fall back to a lookup only if the agent
+	// did not provide it (older agent).
+	if ifindex <= 0 {
+		link, lerr := netlink.LinkByName(intf.Name)
+		if lerr != nil {
+			_ = file.Close()
+			return fmt.Errorf("lookup tap link %s: %w", intf.Name, lerr)
+		}
+		ifindex = link.Attrs().Index
 	}
 	tap := &Tap{
-		Index: link.Attrs().Index,
+		Index: ifindex,
 		Name:  intf.Name,
 		IP:    append(net.IP(nil), intf.IPAddr...),
 		File:  file,
@@ -1109,59 +1226,62 @@ type networkAgentTapFDRequest struct {
 type networkAgentTapFDResponse struct {
 	ErrCode string `json:"errCode"`
 	ErrMsg  string `json:"errMsg"`
+	// IfIndex is the tap's kernel ifindex, returned by network-agent so the
+	// caller can avoid a separate netlink LinkByName on the create hot path.
+	IfIndex int `json:"ifindex"`
 }
 
-func requestNetworkAgentTapFile(socketPath, sandboxID, tapName string) (*os.File, error) {
+func requestNetworkAgentTapFile(socketPath, sandboxID, tapName string, timeout time.Duration) (*os.File, int, error) {
 	if socketPath == "" {
-		return nil, fmt.Errorf("network-agent tap socket is empty")
+		return nil, 0, fmt.Errorf("network-agent tap socket is empty")
 	}
 	addr := &net.UnixAddr{Name: socketPath, Net: "unix"}
 	conn, err := net.DialUnix("unix", nil, addr)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	defer conn.Close()
-	if err := conn.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
-		return nil, err
+	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
+		return nil, 0, err
 	}
 	reqBody, err := json.Marshal(&networkAgentTapFDRequest{
 		Name:      tapName,
 		SandboxID: sandboxID,
 	})
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	if _, err := conn.Write(reqBody); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	buf := make([]byte, 1024)
 	oob := make([]byte, 1024)
 	n, oobn, _, _, err := conn.ReadMsgUnix(buf, oob)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	resp := &networkAgentTapFDResponse{}
 	if err := json.Unmarshal(buf[:n], resp); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	if resp.ErrCode != "" && resp.ErrCode != "0" {
-		return nil, errors.New(resp.ErrMsg)
+		return nil, 0, errors.New(resp.ErrMsg)
 	}
 	msgs, err := syscall.ParseSocketControlMessage(oob[:oobn])
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	for _, msg := range msgs {
 		fds, err := syscall.ParseUnixRights(&msg)
 		if err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		if len(fds) == 0 {
 			continue
 		}
-		return os.NewFile(uintptr(fds[0]), "/dev/net/tun"), nil
+		return os.NewFile(uintptr(fds[0]), "/dev/net/tun"), resp.IfIndex, nil
 	}
-	return nil, fmt.Errorf("network-agent tap fd response missing fd")
+	return nil, 0, fmt.Errorf("network-agent tap fd response missing fd")
 }
 
 func (l *local) loadNet(sandboxID string) *MvmNet {
@@ -1171,4 +1291,24 @@ func (l *local) loadNet(sandboxID string) *MvmNet {
 	}
 
 	return mvmNet.(*MvmNet)
+}
+
+func getGwIPAndMask(cidr string) (net.IP, int, error) {
+	prefix, err := netip.ParsePrefix(cidr)
+	if err != nil {
+		return nil, 0, err
+	}
+	if !prefix.Addr().Is4() {
+		return nil, 0, fmt.Errorf("invalid IPv4 CIDR: %s", cidr)
+	}
+	mask := prefix.Bits()
+	if mask < 8 || mask > 30 {
+		return nil, 0, &net.ParseError{Type: "cidr mask fail", Text: cidr}
+	}
+	// Gateway is network address + 1
+	gwAddr := prefix.Masked().Addr().Next()
+	if !gwAddr.IsValid() {
+		return nil, 0, fmt.Errorf("gateway IP address out of bounds for CIDR: %s", cidr)
+	}
+	return gwAddr.AsSlice(), mask, nil
 }

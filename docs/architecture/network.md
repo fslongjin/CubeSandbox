@@ -22,17 +22,15 @@ CubeVS attaches one BPF program to each of the three network boundaries a packet
 
 | Program | File | Attach Point | Direction | Role |
 |---------|------|-------------|-----------|------|
-| `from_cube` | `mvmtap.bpf.c` | TC ingress on each TAP device | Sandbox --> Host | SNAT, policy check, session creation, ARP proxy |
+| `from_cube` | `mvmtap.bpf.c` | TC ingress on each TAP device | Sandbox --> Host | SNAT, policy check, L7 proxy selection, session creation, ARP proxy |
 | `from_world` | `nodenic.bpf.c` | TC ingress on host NIC (eth0) | External --> Host | Reverse NAT, port-mapping proxy |
-| `from_envoy` | `localgw.bpf.c` | TC egress on cube-dev | Overlay --> Sandbox | DNAT overlay traffic to sandbox IP, redirect to TAP |
-
-A fourth, lightweight program -- `filter_from_cube` -- is attached via XDP on cube-dev. It serves as an early-reject filter, dropping unsolicited inbound TCP and UDP packets before they enter the TC layer, while still allowing ICMP and packets that belong to existing sessions.
+| `from_envoy` | `localgw.bpf.c` | TC egress on cube-dev | Overlay / TPROXY proxy --> Sandbox | DNAT traffic to sandbox IP, preserve transparent-proxy remote source IP, redirect to TAP |
 
 ### 1.3 The Go Control Plane
 
 The `cubevs/` Go package wraps the BPF lifecycle:
 
-- **`Init()`** loads and pins all three BPF object files, rewrites compile-time constants (IPs, MACs, interface indices), and attaches TC / XDP filters.
+- **`Init()`** loads and pins all three BPF object files, rewrites compile-time constants (IPs, MACs, interface indices), and attaches TC filters.
 - **`AddTAPDevice()` / `DelTAPDevice()`** register and deregister sandbox TAP devices, including their metadata and network policies.
 - **`AttachFilter()`** creates the clsact qdisc on a TAP device and attaches the `from_cube` TC filter.
 - **`SetSNATIPs()`** populates the SNAT IP pool.
@@ -80,10 +78,11 @@ graph LR
 3. `from_cube` checks whether the destination is the sandbox gateway (`169.254.68.5`). If so, this is overlay-bound traffic -- the filter DNATs the destination to cube-dev and redirects the packet there.
 4. For all other destinations, `from_cube`:
    - **Evaluates network policy** against the destination IP (see [Section 5](#5-network-policy)).
-   - **Creates or updates a NAT session** in `egress_sessions` and `ingress_sessions`.
+   - **Selects the L7 proxy path** for policy-matched `L7_REQUIRED` TCP `:80` / `:443` packets by redirecting the original packet to `cube-dev` ingress. Host TPROXY then matches `iif cube-dev + dport 80/443`; no fwmark is required.
+   - **Creates or updates a NAT session** in `egress_sessions` and `ingress_sessions` for traffic that does not require L7 proxying.
    - **Performs SNAT**: replaces the sandbox source IP and port with an IP from the SNAT pool and a dynamically allocated port, updating L3 and L4 checksums.
    - **Redirects** the rewritten packet to the host NIC.
-5. The packet leaves the host toward the external network.
+5. Normal packets leave the host toward the external network; L7-required HTTP(S) packets enter the local TPROXY listener through `cube-dev`.
 
 ### 2.2 Ingress: External Network to Sandbox
 
@@ -102,19 +101,19 @@ graph LR
 - **Session-based reverse NAT** -- The filter looks up the packet's 5-tuple in `ingress_sessions`. If a match is found, it reconstructs the original sandbox-side 5-tuple, performs reverse DNAT (rewriting destination IP and port back to the sandbox's internal address), and redirects the packet to the correct TAP device.
 - **Port-mapped proxy** -- If no session matches, the filter checks `remote_port_mapping` using the destination port. A match means this is an inbound connection to a service the sandbox is exposing. The filter DNATs the packet to the sandbox's listen port and redirects to the TAP.
 
-### 2.3 Overlay Traffic: Envoy to Sandbox
+### 2.3 Local Proxy / Overlay Traffic to Sandbox
 
-Traffic arriving from the overlay network (e.g., from a sidecar proxy) enters through cube-dev:
+Traffic arriving from the local transparent proxy or overlay network enters through cube-dev:
 
 ```mermaid
 graph LR
-    A["Overlay / Envoy"] -->|packet| B["cube-dev"]
+    A["OpenResty TPROXY / Overlay"] -->|packet| B["cube-dev"]
     B -->|TC egress| C["from_envoy<br/>(localgw.bpf.c)"]
     C -->|DNAT to sandbox IP<br/>redirect| D["TAP Device"]
     D --> E["Sandbox"]
 ```
 
-`from_envoy` rewrites the destination IP from the overlay address to the sandbox's internal IP (`169.254.68.6`), sets the source to the gateway IP (`169.254.68.5`), and redirects the packet to the appropriate TAP device by looking up `mvmip_to_ifindex`.
+`from_envoy` rewrites the destination IP from the overlay/proxy-facing address to the sandbox's internal IP (`169.254.68.6`) and redirects the packet to the appropriate TAP device by looking up `mvmip_to_ifindex`. Source SNAT is conditional: gateway-originated packets (`src == cubegw0_ip`) are rewritten to the sandbox gateway IP (`169.254.68.5`), while IP_TRANSPARENT proxy replies keep the original remote source IP so the sandbox sees the real peer.
 
 ---
 
@@ -184,7 +183,7 @@ After a successful allocation, `from_cube` updates the IP header (source IP and 
 
 DNAT occurs in two contexts:
 
-1. **Overlay traffic** (`from_envoy` on cube-dev) -- The destination IP is rewritten from the overlay address to the sandbox's internal IP (`169.254.68.6`), and the source is set to the gateway address (`169.254.68.5`). The packet is redirected to the correct TAP device.
+1. **Local proxy / overlay traffic** (`from_envoy` on cube-dev) -- The destination IP is rewritten from the proxy/overlay-facing address to the sandbox's internal IP (`169.254.68.6`). Gateway-originated packets are sourced from the sandbox gateway address (`169.254.68.5`), but IP_TRANSPARENT proxy replies preserve the original remote source IP. The packet is redirected to the correct TAP device.
 
 2. **Session reply traffic** (`from_world` on host NIC) -- The destination IP and port are rewritten from the node's SNAT address back to the sandbox's original source address and port. The reaper has not yet cleaned the session, so the reverse-lookup in `ingress_sessions` provides the sandbox-side coordinates.
 
@@ -270,6 +269,16 @@ This path does not create entries in the session tables, which keeps the maps le
 
 The Go API provides `AddPortMapping()`, `DelPortMapping()`, `ListPortMapping()`, and `GetPortMapping()` for managing mappings at runtime.
 
+### 6.4 Compute-Node Port Allocation
+
+To prevent collisions between subsystems, the host's usable port space is partitioned into three ranges:
+
+| Port range | Purpose | Allocator |
+|------------|---------|-----------|
+| `10000`--`19999` | `ip_local_port_range` (host ephemeral ports) | Set by network-agent at startup |
+| `20000`--`29999` | Ports CubeProxy uses to reach sandboxes | Allocated by network-agent when a sandbox is created |
+| `30000`--`65535` | Source ports used by host SNAT for sandbox-originated traffic | Allocated by CubeVS during SNAT |
+
 ---
 
 ## 7. TAP Device Lifecycle
@@ -323,8 +332,6 @@ When a sandbox is destroyed, `DelTAPDevice(ifindex, ip)`:
    - `from_world` is attached to the host NIC's TC ingress hook (handling external-to-sandbox reply traffic).
    - `from_world` is also attached to the loopback interface for completeness.
 
-4. **Attach XDP** -- `filter_from_cube` is attached to cube-dev's XDP hook. This provides an early, high-performance rejection of unsolicited inbound TCP/UDP traffic before it reaches the TC layer.
-
 ### 8.2 Constant Rewriting
 
 BPF programs cannot read configuration files at runtime. Instead, CubeVS uses a pattern common in the eBPF ecosystem: global variables in the BPF C source are compiled as constants, and the Go loader rewrites their values in the ELF object before loading it into the kernel. This approach gives the programs the performance of compile-time constants (the verifier can optimize branches) with the flexibility of runtime configuration.
@@ -360,7 +367,7 @@ graph TB
     end
     
     subgraph "Host Kernel"
-        CD["cube-dev<br/>(from_envoy + XDP filter)"]
+        CD["cube-dev<br/>(from_envoy)"]
         NIC["Host NIC - eth0<br/>(from_world)"]
     end
     

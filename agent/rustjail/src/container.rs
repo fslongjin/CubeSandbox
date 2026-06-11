@@ -1425,7 +1425,7 @@ impl LinuxContainer {
             Some(unistd::getuid()),
             Some(unistd::getgid()),
         )
-        .context(format!("cannot change onwer of container {} root", id))?;
+        .context(format!("cannot change owner of container {} root", id))?;
 
         if config.spec.is_none() {
             return Err(anyhow!(nix::Error::EINVAL));

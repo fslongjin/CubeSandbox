@@ -24,7 +24,7 @@ Cube Sandbox 是 Tencent 自研的安全沙箱基础设施，兼容 E2B SDK，�
 ```bash
 export CUBE_TEMPLATE_ID=<模板ID>       # 沙箱镜像模板，必填
 export E2B_API_URL=http://<host>:3000  # Cube API 地址（用于创建沙箱），必填
-export E2B_API_KEY=dummy               # SDK 非空校验用，填任意字符串
+export E2B_API_KEY=e2b_000000               # SDK 非空校验用，填任意字符串
 ```
 
 ### SSL 证书配置（按需）
@@ -35,7 +35,7 @@ export E2B_API_KEY=dummy               # SDK 非空校验用，填任意字符�
 
 ```bash
 # 如果部署机器使用 mkcert，证书通常在以下位置
-export SSL_CERT_FILE=$(mkcert -CAROOT)/rootCA.pem
+export SSL_CERT_FILE=/root/.local/share/mkcert/rootCA.pem
 
 # 或者指定自定义证书路径
 export SSL_CERT_FILE=/path/to/your/rootCA.pem
@@ -85,12 +85,12 @@ pip install e2b-code-interpreter
 # 必需配置
 export CUBE_TEMPLATE_ID="tpl-4cc15c28f7a04115a295c159"
 export E2B_API_URL="http://127.0.0.1:3000"
-export E2B_API_KEY="dummy"
+export E2B_API_KEY="e2b_000000"
 
 # 使用 cube.app 测试证书时才需要配置（自定义受信任域名或 HTTP 访问可不填）
 export SSL_CERT_FILE="/Users/username/Downloads/rootCA.pem"
 # 或
-# export SSL_CERT_FILE=$(mkcert -CAROOT)/rootCA.pem
+# export SSL_CERT_FILE=/root/.local/share/mkcert/rootCA.pem
 ```
 
 ### 重要说明

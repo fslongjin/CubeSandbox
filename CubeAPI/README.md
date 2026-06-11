@@ -40,8 +40,6 @@ The following Sandbox core APIs are **fully E2B-compatible** and can be used dir
 
 **Legend:** ✅ Fully implemented | ❌ Route not registered or depends on pending CubeMaster APIs
 
-> See [docs/cubemaster-api-requirements.md](docs/cubemaster-api-requirements.md) for pending CubeMaster API details.
-
 ### Cube Extensions
 
 | Feature | Description |
@@ -68,8 +66,10 @@ cargo build --release
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `BIND` | `0.0.0.0:3000` | Listen address |
+| `CUBE_API_BIND` | `0.0.0.0:3000` | Listen address |
 | `LOG_LEVEL` | `info` | Log level |
+
+CubeAPI also exposes dashboard-oriented routes under `/cubeapi/v1`. The one-click WebUI is served by a separate nginx container on port `12088`; that nginx instance serves the packaged static dashboard and proxies same-origin `/cubeapi` requests back to the host CubeAPI through Docker `host-gateway`.
 
 ---
 
@@ -111,14 +111,14 @@ The following four environment variables must be exported before running:
 |----------|-------------|
 | `CUBE_TEMPLATE_ID` | Cube sandbox template ID. All examples use this to determine which template to create sandboxes from; must be explicitly set. |
 | `E2B_API_URL` | Address of the Cube E2B API service. The SDK defaults to the official E2B cloud service, so this must be overridden with the local or deployed address — otherwise requests will go to the official service instead of Cube. |
-| `E2B_API_KEY` | The E2B SDK requires this field to be present (it performs a non-empty check). For local deployments, any non-empty string works, e.g. `dummy`. |
-| `SSL_CERT_FILE` | When accessing sandboxes using Cube's built-in test certificate (`cube.app`), set this variable to the corresponding CA root certificate path so that the E2B SDK's httpx/requests can complete TLS verification. We recommend using a locally signed certificate from mkcert: `$(mkcert -CAROOT)/rootCA.pem`.<br>If you use a custom domain with a trusted certificate, or access sandboxes over HTTP, this variable is not needed. See [CubeProxy TLS Configuration](../docs/guide/cubeproxy-tls.md). |
+| `E2B_API_KEY` | The E2B SDK requires this field to be present (it performs a non-empty check). For local deployments, any non-empty string works, e.g. `e2b_000000`. |
+| `SSL_CERT_FILE` | When accessing sandboxes using Cube's built-in test certificate (`cube.app`), set this variable to the corresponding CA root certificate path so that the E2B SDK's httpx/requests can complete TLS verification. We recommend using a locally signed certificate from mkcert: `/root/.local/share/mkcert/rootCA.pem`.<br>If you use a custom domain with a trusted certificate, or access sandboxes over HTTP, this variable is not needed. See [CubeProxy TLS Configuration](../docs/guide/cubeproxy-tls.md). |
 
 ```bash
 export CUBE_TEMPLATE_ID=<your-template-id>
 export E2B_API_URL=http://localhost:3000
-export E2B_API_KEY=dummy
-export SSL_CERT_FILE=$(mkcert -CAROOT)/rootCA.pem
+export E2B_API_KEY=e2b_000000
+export SSL_CERT_FILE=/root/.local/share/mkcert/rootCA.pem
 ```
 
 **3. Run**
@@ -133,40 +133,3 @@ python create_with_mount.py
 python browser.py
 python test.py
 
----
-
-## Benchmark Tool (Go)
-
-The [`benchmark/`](benchmark/) directory contains a high-performance benchmark tool written in Go with goroutine-based concurrency and a rich terminal UI (powered by [Charm](https://charm.sh) — bubbletea + lipgloss). It directly calls CubeAPI HTTP endpoints for accurate, low-overhead latency measurement.
-
-### Build
-
-```bash
-cd benchmark
-go build -o cube-bench .
-```
-
-### Usage
-
-```bash
-# Concurrent create+delete benchmark
-./cube-bench -c 20 -n 200 --api-url http://localhost:3000 --api-key dummy -t <template-id>
-
-# Dry-run mode (no server needed, simulates latencies for TUI debugging)
-./cube-bench --dry-run -c 50 -n 500
-
-# Light theme for light terminals
-./cube-bench --dry-run --theme light -c 10 -n 100
-
-# Create-only mode with JSON export
-./cube-bench --dry-run -c 20 -n 200 -m create-only -o report.json
-```
-
-### Features
-
-- Goroutine pool with configurable concurrency — easily saturates 10K+ req/s
-- Live dashboard with progress bar, real-time QPS, and operation log (bubbletea)
-- Detailed final report: percentile table, latency histogram, sparkline timeline, S/A/B/C/D grade
-- Dark/light theme with auto-detection (`--theme auto|dark|light`)
-- JSON report export (`-o report.json`)
-- Dry-run mode for TUI development (`--dry-run`)

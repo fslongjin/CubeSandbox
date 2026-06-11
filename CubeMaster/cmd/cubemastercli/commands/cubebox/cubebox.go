@@ -17,7 +17,21 @@ var Command = cli.Command{
 		MultiRun,
 		ListCommand,
 		InfoCommand,
+		DestroyCommand,
+		RollbackCommand,
+		SandboxCommand,
 		NodeCommand,
+		SnapshotCommand,
+		StorageCommand,
+		OperationCommand,
 		TemplateCommand,
+	},
+}
+
+var SandboxCommand = cli.Command{
+	Name:  "sandbox",
+	Usage: "sandbox operations",
+	Subcommands: cli.Commands{
+		RollbackCommand,
 	},
 }
