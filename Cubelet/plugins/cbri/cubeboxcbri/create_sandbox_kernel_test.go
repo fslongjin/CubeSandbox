@@ -273,6 +273,78 @@ func TestCreateSandboxRestartPinsGuestArtifacts(t *testing.T) {
 	)
 }
 
+// The production shape: a sandbox created from a template carries an ext4
+// container image, so CreateSandbox resolves a per-image cached kernel and
+// leaves the os-image and agent annotations unset. The pin must replace the
+// cached kernel too, otherwise the next snapshot records a kernel that the
+// catalog does not agree with.
+func TestCreateSandboxRestartPinsGuestArtifactsWithImage(t *testing.T) {
+	t.Parallel()
+
+	plugin := newTestCubeboxPlugin(t)
+	artifactID := "artifact-1"
+	inventory := t.TempDir()
+	pinnedKernelPath := filepath.Join(inventory, "cube-kernel-scf", "pin-k", "vmlinux")
+	cachedKernelPath := plugin.getKernelFilePath(artifactID)
+	require.NotEqual(t, cachedKernelPath, pinnedKernelPath)
+
+	flow := &workflow.CreateContext{
+		ReqInfo: &cubebox.RunCubeSandboxRequest{
+			InstanceType: "cubebox",
+			Containers: []*cubebox.ContainerConfig{
+				{
+					Resources: &cubebox.Resource{Cpu: "2000m", Mem: "2000Mi"},
+					Image: &cubeimages.ImageSpec{
+						Image:        artifactID,
+						StorageMedia: cubeimages.ImageStorageMediaType_ext4.String(),
+					},
+				},
+			},
+		},
+		IsRestart: true,
+		LocalRunTemplate: &templatetypes.LocalRunTemplate{
+			Componts: map[string]templatetypes.LocalComponent{
+				string(templatetypes.CubeComponentCubeKernel): {
+					Component: templatetypes.MachineComponent{
+						Name: templatetypes.CubeComponentCubeKernel, Version: "pin-k", Path: pinnedKernelPath,
+					},
+				},
+				string(templatetypes.CubeComponentCubeImage): {
+					Component: templatetypes.MachineComponent{
+						Name:    templatetypes.CubeComponentCubeImage,
+						Version: "pin-i",
+						Path:    filepath.Join(inventory, "cube-image", "pin-i", "cube-guest-image-cpu.img"),
+					},
+				},
+				string(templatetypes.CubeComponentCubeAgent): {
+					Component: templatetypes.MachineComponent{
+						Name:    templatetypes.CubeComponentCubeAgent,
+						Version: "pin-a",
+						Path:    filepath.Join(inventory, "cube-agent", "pin-a", "cube-agent.ext4"),
+					},
+				},
+			},
+		},
+	}
+
+	ctx := constants.WithAppImageID(context.Background(), artifactID)
+	opts, err := plugin.CreateSandbox(ctx, flow)
+	require.NoError(t, err)
+	spec := applySpecOpts(t, ctx, opts)
+
+	require.Equal(t, pinnedKernelPath, spec.Annotations[constants.AnnotationsVMKernelPath],
+		"the pinned inventory kernel must replace the per-image cached kernel")
+	require.NotEqual(t, cachedKernelPath, spec.Annotations[constants.AnnotationsVMKernelPath])
+	require.Equal(t,
+		filepath.Join(inventory, "cube-image", "pin-i", "cube-guest-image-cpu.img"),
+		spec.Annotations[constants.AnnotationsVMOSImagePath],
+	)
+	require.Equal(t,
+		filepath.Join(inventory, "cube-agent", "pin-a", "cube-agent.ext4"),
+		spec.Annotations[constants.AnnotationsVMAgentPath],
+	)
+}
+
 // Without a pin the restart keeps the toolbox default, so behaviour for
 // sandboxes created outside a template is unchanged.
 func TestCreateSandboxRestartWithoutPinFallsBackToToolbox(t *testing.T) {

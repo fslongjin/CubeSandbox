@@ -367,7 +367,9 @@ func (e *cubeboxInstancePlugin) CreateSandbox(ctx context.Context, flowOpts *wor
 
 		// Restart bypasses the branches above, so re-apply the guest artifact
 		// pin: the toolbox default would make the next snapshot disagree with
-		// the catalog and fail to restore.
+		// the catalog and fail to restore. This intentionally replaces the
+		// per-image cached kernel resolved above, which tracks the live toolbox
+		// rather than the pin.
 		if flowOpts.IsRestart {
 			e.applyPinnedGuestArtifacts(annotations, flowOpts.LocalRunTemplate)
 		}
