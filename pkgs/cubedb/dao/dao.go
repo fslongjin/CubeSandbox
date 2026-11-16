@@ -10,6 +10,8 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -48,14 +50,18 @@ type configIdentity struct {
 	MaxOpenConns                int
 	MaxConnLifeTimeSeconds      int
 	MigrationLockTimeoutSeconds int
+	// Extra carries engine-specific knobs (e.g. GoldenDB load-balance mode).
+	// It is flattened into a comparable string because engine settings that
+	// live outside this struct still have to distinguish two Open() calls.
+	Extra string
 }
 
 func (i configIdentity) String() string {
-	return fmt.Sprintf("driver=%s addr=%s user=%s db=%s conn_timeout=%d read_timeout=%d write_timeout=%d max_idle=%d max_open=%d max_lifetime=%d migration_lock_timeout=%d",
+	return fmt.Sprintf("driver=%s addr=%s user=%s db=%s conn_timeout=%d read_timeout=%d write_timeout=%d max_idle=%d max_open=%d max_lifetime=%d migration_lock_timeout=%d extra=%s",
 		i.Driver, i.Addr, i.User, i.DBName,
 		i.ConnTimeoutSeconds, i.ReadTimeoutSeconds, i.WriteTimeoutSeconds,
 		i.MaxIdleConns, i.MaxOpenConns, i.MaxConnLifeTimeSeconds,
-		i.MigrationLockTimeoutSeconds)
+		i.MigrationLockTimeoutSeconds, i.Extra)
 }
 
 var (
@@ -130,7 +136,29 @@ func identityFromConfig(cfg Config) configIdentity {
 		MaxOpenConns:                cfg.MaxOpenConns,
 		MaxConnLifeTimeSeconds:      cfg.MaxConnLifeTimeSeconds,
 		MigrationLockTimeoutSeconds: cfg.MigrationLockTimeoutSeconds,
+		Extra:                       flattenExtra(cfg.Extra),
 	}
+}
+
+// flattenExtra renders Extra as a stable, comparable string. Sorting keeps
+// map iteration order from making two identical configs look different.
+func flattenExtra(extra map[string]string) string {
+	if len(extra) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(extra))
+	for k := range extra {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var b strings.Builder
+	for _, k := range keys {
+		b.WriteString(k)
+		b.WriteByte('=')
+		b.WriteString(extra[k])
+		b.WriteByte(';')
+	}
+	return b.String()
 }
 
 // Default returns the global GORM handle established by Open. It panics

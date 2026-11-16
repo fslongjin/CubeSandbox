@@ -203,13 +203,38 @@ blobstore_module_at_ref() {
   return 1
 }
 
-require_blobstore_module() {
+# The GoldenDB driver is a vendored sibling module replace-pointed at by
+# pkgs/cubedb and every control-plane consumer. Older SOURCE_REF trees predate
+# it, so probe instead of failing.
+goldendb_module_at_ref() {
+  local sha="$1"
+  if git -C "${WORKTREE_ROOT}" cat-file -e "${sha}:pkgs/third_party/goldendb-go-sql-driver/go.mod" 2>/dev/null; then
+    printf '%s\n' "pkgs/third_party/goldendb-go-sql-driver"
+    return 0
+  fi
+  return 1
+}
+
+require_goldendb_module() {
   local gomod
   for gomod in \
     "${REPO_ROOT}/CubeMaster/go.mod" \
     "${REPO_ROOT}/CubeOps/go.mod" \
     "${REPO_ROOT}/CubeTemplateCenter/go.mod"; do
-    if [[ -f "${gomod}" ]] && grep -q 'pkgs/blobstore' "${gomod}"; then
+    if [[ -f "${gomod}" ]] && grep -q 'pkgs/third_party/goldendb-go-sql-driver' "${gomod}"; then
+      [[ -d "${REPO_ROOT}/pkgs/third_party/goldendb-go-sql-driver" ]] \
+        || fail "missing pkgs/third_party/goldendb-go-sql-driver sibling module in ${REPO_ROOT}"
+      return 0
+    fi
+  done
+}
+
+require_blobstore_module() {
+  local gomod
+  for gomod in \
+    "${REPO_ROOT}/CubeMaster/go.mod" \
+    "${REPO_ROOT}/CubeOps/go.mod" \
+    "${REPO_ROOT}/CubeTemplateCenter/go.mod"; do    if [[ -f "${gomod}" ]] && grep -q 'pkgs/blobstore' "${gomod}"; then
       [[ -d "${REPO_ROOT}/pkgs/blobstore" ]] \
         || fail "missing pkgs/blobstore sibling module in ${REPO_ROOT}"
       return 0
@@ -460,6 +485,7 @@ ensure_source_tree() {
   CUBELOG_SRC=""
   CUBEDB_SRC=""
   BLOBSTORE_SRC=""
+  GOLDENDB_SRC=""
   if should_build cube-master || should_build cubemastercli \
      || should_build cubelet || should_build cube-ops \
      || should_build cube-templatecenter; then
@@ -474,6 +500,7 @@ ensure_source_tree() {
   if should_build cube-master || should_build cubemastercli \
      || should_build cube-ops || should_build cube-templatecenter; then
     BLOBSTORE_SRC="$(blobstore_module_at_ref "${SOURCE_REF_SHA}" || true)"
+    GOLDENDB_SRC="$(goldendb_module_at_ref "${SOURCE_REF_SHA}" || true)"
   fi
   PROTO_SRC=""
   if should_build cube-master || should_build cubemastercli \
@@ -503,6 +530,11 @@ ensure_source_tree() {
   fi
   if [[ -n "${BLOBSTORE_SRC}" ]]; then
     SOURCE_EXPORT_SET="${SOURCE_EXPORT_SET} ${BLOBSTORE_SRC}"
+  fi
+  # Consumers replace-point at the vendored GoldenDB driver, so it must be in
+  # the exported tree or `go build` fails on a missing replace target.
+  if [[ -n "${GOLDENDB_SRC}" ]]; then
+    SOURCE_EXPORT_SET="${SOURCE_EXPORT_SET} ${GOLDENDB_SRC}"
   fi
   if should_build cubemastercli; then
     SOURCE_EXPORT_SET="${SOURCE_EXPORT_SET} CubeOps"
@@ -758,6 +790,7 @@ build_cube_master_image() {
   require_cubelog_module
   require_cubedb_module
   require_blobstore_module
+  require_goldendb_module
   [[ -d "${REPO_ROOT}/Cubelet" ]] || fail "missing Cubelet sibling module in ${REPO_ROOT}"
   [[ -f "${REPO_ROOT}/deploy/scripts/docker-install-volume-deps.sh" ]] \
     || fail "missing deploy/scripts/docker-install-volume-deps.sh in ${REPO_ROOT}"
@@ -785,6 +818,7 @@ build_cube_templatecenter_image() {
   require_cubelog_module
   require_cubedb_module
   require_blobstore_module
+  require_goldendb_module
   [[ -d "${REPO_ROOT}/pkgs/proto" ]] || fail "missing pkgs/proto sibling module in ${REPO_ROOT}"
   [[ -d "${REPO_ROOT}/Cubelet" ]] || fail "missing Cubelet sibling module in ${REPO_ROOT}"
   build_image cube-templatecenter "${REPO_ROOT}" "${REPO_ROOT}/CubeTemplateCenter/docker/Dockerfile" \
@@ -805,6 +839,7 @@ build_cubemastercli_image() {
   require_cubelog_module
   require_cubedb_module
   require_blobstore_module
+  require_goldendb_module
   [[ -d "${REPO_ROOT}/Cubelet" ]] || fail "missing Cubelet sibling module in ${REPO_ROOT}"
   build_image cubemastercli "${REPO_ROOT}" "${REPO_ROOT}/CubeMaster/docker/Dockerfile.cubemastercli" \
     --build-arg "CUBE_VERSION=${IMAGE_TAG}" \
@@ -865,6 +900,7 @@ build_cube_ops_image() {
   require_cubedb_module
   require_cubelog_module
   require_blobstore_module
+  require_goldendb_module
   build_image cube-ops "${REPO_ROOT}" "${REPO_ROOT}/CubeOps/Dockerfile"
   record_built cube-ops
 }

@@ -7,6 +7,7 @@ require (
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/ory/dockertest/v3 v3.12.0
 	github.com/pressly/goose/v3 v3.27.1
+	github.com/tencentcloud/CubeSandbox/pkgs/third_party/goldendb-go-sql-driver v0.0.0-00010101000000-000000000000
 	gorm.io/driver/mysql v1.5.1
 	gorm.io/driver/postgres v1.6.0
 	gorm.io/gorm v1.25.10
@@ -62,3 +63,5 @@ require (
 	golang.org/x/sys v0.44.0 // indirect
 	golang.org/x/text v0.36.0 // indirect
 )
+
+replace github.com/tencentcloud/CubeSandbox/pkgs/third_party/goldendb-go-sql-driver => ../third_party/goldendb-go-sql-driver

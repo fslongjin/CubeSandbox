@@ -20,6 +20,9 @@
 !pkgs/sandboxrestart/**
 !pkgs/redisx
 !pkgs/redisx/**
+!pkgs/third_party
+!pkgs/third_party/goldendb-go-sql-driver
+!pkgs/third_party/goldendb-go-sql-driver/**
 # Volume plugin host tools installer used by the runtime stage.
 !deploy
 !deploy/scripts

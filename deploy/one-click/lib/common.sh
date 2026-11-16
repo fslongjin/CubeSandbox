@@ -722,6 +722,13 @@ ONE_CLICK_DB_ENGINE_INTENT_KEYS=(
   CUBE_EXTERNAL_POSTGRES_USER
   CUBE_EXTERNAL_POSTGRES_PASSWORD
   CUBE_EXTERNAL_POSTGRES_DB
+  CUBE_EXTERNAL_GOLDENDB_ADDRS
+  CUBE_EXTERNAL_GOLDENDB_USER
+  CUBE_EXTERNAL_GOLDENDB_PASSWORD
+  CUBE_EXTERNAL_GOLDENDB_DB
+  CUBE_EXTERNAL_GOLDENDB_MODE
+  CUBE_EXTERNAL_GOLDENDB_PROXY_GROUPS
+  CUBE_EXTERNAL_GOLDENDB_MIN_CONNECTION_PROXYS
 )
 ONE_CLICK_DB_INTENT_KEYS=(
   "${ONE_CLICK_DB_ENGINE_INTENT_KEYS[@]}"
@@ -783,6 +790,16 @@ _clear_one_click_external_postgres_env() {
   CUBE_EXTERNAL_POSTGRES_DB=""
 }
 
+_clear_one_click_external_goldendb_env() {
+  CUBE_EXTERNAL_GOLDENDB_ADDRS=""
+  CUBE_EXTERNAL_GOLDENDB_USER=""
+  CUBE_EXTERNAL_GOLDENDB_PASSWORD=""
+  CUBE_EXTERNAL_GOLDENDB_DB=""
+  CUBE_EXTERNAL_GOLDENDB_MODE=""
+  CUBE_EXTERNAL_GOLDENDB_PROXY_GROUPS=""
+  CUBE_EXTERNAL_GOLDENDB_MIN_CONNECTION_PROXYS=""
+}
+
 _one_click_db_intent_declared() {
   local key="$1"
   [[ -n "${ONE_CLICK_DB_DOTENV_PRESENT[${key}]+x}" || -n "${ONE_CLICK_DB_ENV_SNAPSHOT[${key}]+x}" ]]
@@ -821,12 +838,17 @@ apply_one_click_database_intent() {
     if _one_click_db_intent_declared CUBE_EXTERNAL_POSTGRES_HOST; then
       CUBE_DATABASE_DRIVER="postgres"
       log "database intent: inferred driver=postgres from this-run CUBE_EXTERNAL_POSTGRES_HOST"
+    elif _one_click_db_intent_declared CUBE_EXTERNAL_GOLDENDB_ADDRS; then
+      CUBE_DATABASE_DRIVER="goldendb"
+      log "database intent: inferred driver=goldendb from this-run CUBE_EXTERNAL_GOLDENDB_ADDRS"
     elif _one_click_db_intent_declared CUBE_EXTERNAL_MYSQL_HOST; then
       CUBE_DATABASE_DRIVER="mysql"
       log "database intent: inferred driver=mysql from this-run CUBE_EXTERNAL_MYSQL_HOST"
     elif [[ -z "${CUBE_DATABASE_DRIVER:-}" ]]; then
       if [[ -n "${CUBE_EXTERNAL_POSTGRES_HOST:-}" ]]; then
         CUBE_DATABASE_DRIVER="postgres"
+      elif [[ -n "${CUBE_EXTERNAL_GOLDENDB_ADDRS:-}" ]]; then
+        CUBE_DATABASE_DRIVER="goldendb"
       else
         CUBE_DATABASE_DRIVER="mysql"
       fi
@@ -834,6 +856,8 @@ apply_one_click_database_intent() {
   elif [[ -z "${CUBE_DATABASE_DRIVER:-}" ]]; then
     if [[ -n "${CUBE_EXTERNAL_POSTGRES_HOST:-}" ]]; then
       CUBE_DATABASE_DRIVER="postgres"
+    elif [[ -n "${CUBE_EXTERNAL_GOLDENDB_ADDRS:-}" ]]; then
+      CUBE_DATABASE_DRIVER="goldendb"
     else
       CUBE_DATABASE_DRIVER="mysql"
     fi
@@ -845,15 +869,29 @@ apply_one_click_database_intent() {
     die "CUBE_EXTERNAL_MYSQL_HOST and CUBE_EXTERNAL_POSTGRES_HOST are mutually exclusive; set CUBE_DATABASE_DRIVER to select one engine"
   fi
   if _one_click_db_intent_declared CUBE_DATABASE_DRIVER; then
-    if [[ "${CUBE_DATABASE_DRIVER}" == "postgres" ]]; then
-      if _one_click_db_intent_declared CUBE_EXTERNAL_MYSQL_HOST           && [[ -n "${CUBE_EXTERNAL_MYSQL_HOST:-}" ]]; then
-        die "CUBE_DATABASE_DRIVER=postgres cannot be combined with CUBE_EXTERNAL_MYSQL_HOST"
-      fi
-    else
-      if _one_click_db_intent_declared CUBE_EXTERNAL_POSTGRES_HOST           && [[ -n "${CUBE_EXTERNAL_POSTGRES_HOST:-}" ]]; then
-        die "CUBE_EXTERNAL_POSTGRES_HOST requires CUBE_DATABASE_DRIVER=postgres"
-      fi
-    fi
+    case "${CUBE_DATABASE_DRIVER}" in
+      postgres)
+        if _one_click_db_intent_declared CUBE_EXTERNAL_MYSQL_HOST           && [[ -n "${CUBE_EXTERNAL_MYSQL_HOST:-}" ]]; then
+          die "CUBE_DATABASE_DRIVER=postgres cannot be combined with CUBE_EXTERNAL_MYSQL_HOST"
+        fi
+        ;;
+      goldendb)
+        if _one_click_db_intent_declared CUBE_EXTERNAL_MYSQL_HOST           && [[ -n "${CUBE_EXTERNAL_MYSQL_HOST:-}" ]]; then
+          die "CUBE_DATABASE_DRIVER=goldendb cannot be combined with CUBE_EXTERNAL_MYSQL_HOST"
+        fi
+        if _one_click_db_intent_declared CUBE_EXTERNAL_POSTGRES_HOST           && [[ -n "${CUBE_EXTERNAL_POSTGRES_HOST:-}" ]]; then
+          die "CUBE_DATABASE_DRIVER=goldendb cannot be combined with CUBE_EXTERNAL_POSTGRES_HOST"
+        fi
+        ;;
+      *)
+        if _one_click_db_intent_declared CUBE_EXTERNAL_POSTGRES_HOST           && [[ -n "${CUBE_EXTERNAL_POSTGRES_HOST:-}" ]]; then
+          die "CUBE_EXTERNAL_POSTGRES_HOST requires CUBE_DATABASE_DRIVER=postgres"
+        fi
+        if _one_click_db_intent_declared CUBE_EXTERNAL_GOLDENDB_ADDRS           && [[ -n "${CUBE_EXTERNAL_GOLDENDB_ADDRS:-}" ]]; then
+          die "CUBE_EXTERNAL_GOLDENDB_ADDRS requires CUBE_DATABASE_DRIVER=goldendb"
+        fi
+        ;;
+    esac
   fi
 
   # Only scrub opposite-engine markers when this run declared an engine key.
@@ -870,17 +908,27 @@ apply_one_click_database_intent() {
     fi
   done
   if [[ "${has_engine_intent}" -eq 1 ]]; then
-    if [[ "${CUBE_DATABASE_DRIVER}" == "postgres" ]]; then
-      _clear_one_click_external_mysql_env
-      log "database intent: driver=postgres host=${CUBE_EXTERNAL_POSTGRES_HOST:-}; cleared opposite CUBE_EXTERNAL_MYSQL_*"
-    else
-      _clear_one_click_external_postgres_env
-      if [[ -n "${CUBE_EXTERNAL_MYSQL_HOST:-}" ]]; then
-        log "database intent: external MySQL host=${CUBE_EXTERNAL_MYSQL_HOST}; cleared opposite CUBE_EXTERNAL_POSTGRES_*"
-      else
-        log "database intent: driver=mysql (no external host); cleared opposite CUBE_EXTERNAL_POSTGRES_*"
-      fi
-    fi
+    case "${CUBE_DATABASE_DRIVER}" in
+      postgres)
+        _clear_one_click_external_mysql_env
+        _clear_one_click_external_goldendb_env
+        log "database intent: driver=postgres host=${CUBE_EXTERNAL_POSTGRES_HOST:-}; cleared opposite CUBE_EXTERNAL_MYSQL_*/GOLDENDB_*"
+        ;;
+      goldendb)
+        _clear_one_click_external_mysql_env
+        _clear_one_click_external_postgres_env
+        log "database intent: driver=goldendb addrs=${CUBE_EXTERNAL_GOLDENDB_ADDRS:-}; cleared opposite CUBE_EXTERNAL_MYSQL_*/POSTGRES_*"
+        ;;
+      *)
+        _clear_one_click_external_postgres_env
+        _clear_one_click_external_goldendb_env
+        if [[ -n "${CUBE_EXTERNAL_MYSQL_HOST:-}" ]]; then
+          log "database intent: external MySQL host=${CUBE_EXTERNAL_MYSQL_HOST}; cleared opposite CUBE_EXTERNAL_POSTGRES_*/GOLDENDB_*"
+        else
+          log "database intent: driver=mysql (no external host); cleared opposite CUBE_EXTERNAL_POSTGRES_*/GOLDENDB_*"
+        fi
+        ;;
+    esac
   fi
   return 0
 }
@@ -1320,16 +1368,131 @@ patch_cubemaster_instance_db_config() {
     "${cfg}"
 }
 
-# patch_conf_external_instance_db points one component conf.yaml (CubeMaster or
-# CubeTemplateCenter) at the external SQL endpoint. Both must share it:
+# remove_conf_goldendb_block deletes the goldendb: sub-block under
+# instance_db_config so a switch back to MySQL/PostgreSQL cannot leave stale
+# GoldenDB settings behind. No-op when the block is absent.
+remove_conf_goldendb_block() {
+  local cfg="$1"
+  ensure_file "${cfg}"
+  [[ -n "$(conf_goldendb_block "${cfg}")" ]] || return 0
+  awk '
+    function indentation(line) {
+      match(line, /^[[:space:]]*/)
+      return RLENGTH
+    }
+    /^instance_db_config:[[:space:]]*$/ { in_instance = 1; instance_indent = 0; print; next }
+    in_instance {
+      if ($0 ~ /^[[:space:]]*$/ || $0 ~ /^[[:space:]]*#/) { print; next }
+      level = indentation($0)
+      if (level == 0) { in_instance = 0 }
+      else if (!in_gdb && $0 ~ /^[[:space:]]*goldendb:[[:space:]]*(#.*)?$/) {
+        in_gdb = 1; gdb_indent = level; next
+      }
+      else if (in_gdb && level <= gdb_indent) { in_gdb = 0 }
+      if (in_gdb) { next }
+      print
+      next
+    }
+    { print }
+  ' "${cfg}" > "${cfg}.goldendb.tmp"
+  mv -f "${cfg}.goldendb.tmp" "${cfg}"
+}
+
+# conf_goldendb_block prints the goldendb: sub-block under instance_db_config,
+# or nothing when it is absent.
+conf_goldendb_block() {
+  local cfg="$1"
+  awk '
+    function indentation(line) {
+      match(line, /^[[:space:]]*/)
+      return RLENGTH
+    }
+    /^instance_db_config:[[:space:]]*$/ { in_instance = 1; next }
+    in_instance {
+      level = indentation($0)
+      if ($0 !~ /^[[:space:]]*(#.*)?$/ && level == 0) { in_instance = 0 }
+      else if (!in_gdb && $0 ~ /^[[:space:]]*goldendb:[[:space:]]*(#.*)?$/) { in_gdb = 1; gdb_indent = level }
+      else if (in_gdb && $0 !~ /^[[:space:]]*(#.*)?$/ && level <= gdb_indent) { in_gdb = 0 }
+      if (in_gdb) { print }
+    }
+  ' "${cfg}"
+}
+
+# upsert_conf_goldendb_block rewrites the goldendb: sub-block under
+# instance_db_config from the CUBE_EXTERNAL_GOLDENDB_* settings. proxy groups
+# are configured as a comma-separated list of ';'-delimited groups, matching
+# the driver's Extra format.
+upsert_conf_goldendb_block() {
+  local cfg="$1"
+  ensure_file "${cfg}"
+  remove_conf_goldendb_block "${cfg}"
+  local mode="${CUBE_EXTERNAL_GOLDENDB_MODE:-masterslave}"
+  local min_proxys="${CUBE_EXTERNAL_GOLDENDB_MIN_CONNECTION_PROXYS:-}"
+  local tmp="${cfg}.goldendb.tmp"
+  awk -v mode="${mode}" -v min_proxys="${min_proxys}" \
+    -v groups="${CUBE_EXTERNAL_GOLDENDB_PROXY_GROUPS:-}" '
+    function indentation(line) {
+      match(line, /^[[:space:]]*/)
+      return RLENGTH
+    }
+    function emit(indent,   n, i, parts) {
+      printf "%sgoldendb:\n", indent
+      printf "%s  mode: \"%s\"\n", indent, mode
+      if (groups != "") {
+        printf "%s  proxy_groups:\n", indent
+        n = split(groups, parts, ";")
+        for (i = 1; i <= n; i++) {
+          gsub(/^[[:space:]]+|[[:space:]]+$/, "", parts[i])
+          if (parts[i] != "") printf "%s    - \"%s\"\n", indent, parts[i]
+        }
+      }
+      if (min_proxys != "") printf "%s  min_connection_proxys: %s\n", indent, min_proxys
+    }
+    BEGIN { emitted = 0 }
+    {
+      if (!emitted && $0 ~ /^instance_db_config:[[:space:]]*$/) {
+        print
+        in_instance = 1
+        next
+      }
+      if (in_instance) {
+        level = indentation($0)
+        if ($0 !~ /^[[:space:]]*(#.*)?$/ && level == 0) {
+          # Leaving the block: emit the sub-block before the next top-level key.
+          if (!emitted) {
+            emit("  ")
+            emitted = 1
+          }
+          in_instance = 0
+          print
+          next
+        }
+        if (!emitted && $0 ~ /^[[:space:]]*conn_timeout:/) {
+          emit("  ")
+          emitted = 1
+        }
+      }
+      print
+    }
+    END {
+      if (!emitted && in_instance) {
+        emit("  ")
+        emitted = 1
+      }
+    }
+  ' "${cfg}" > "${tmp}"
+  mv -f "${tmp}" "${cfg}"
+}
+
+# patch_conf_external_instance_db points one component conf.yaml (CubeMaster or# CubeTemplateCenter) at the external SQL endpoint. Both must share it:
 # TemplateCenter has no environment override for the database. No-op without an
 # external host or without the file (older packages omit TC); otherwise the
 # instance_db_config block must exist and end up on the requested driver, or it
-# dies. PostgreSQL wins if both hosts are set.
+# dies. PostgreSQL wins if both hosts are set, then GoldenDB.
 patch_conf_external_instance_db() {
   local cfg="$1"
   [[ -f "${cfg}" ]] || return 0
-  if [[ -z "${CUBE_EXTERNAL_POSTGRES_HOST:-}" && -z "${CUBE_EXTERNAL_MYSQL_HOST:-}" ]]; then
+  if [[ -z "${CUBE_EXTERNAL_POSTGRES_HOST:-}" && -z "${CUBE_EXTERNAL_MYSQL_HOST:-}" && -z "${CUBE_EXTERNAL_GOLDENDB_ADDRS:-}" ]]; then
     return 0
   fi
 
@@ -1350,6 +1513,18 @@ patch_conf_external_instance_db() {
       "${CUBE_EXTERNAL_POSTGRES_USER:-cube}" \
       "${CUBE_EXTERNAL_POSTGRES_PASSWORD:-}" \
       "${CUBE_EXTERNAL_POSTGRES_DB:-cube_mvp}"
+    remove_conf_goldendb_block "${cfg}"
+  elif [[ -n "${CUBE_EXTERNAL_GOLDENDB_ADDRS:-}" ]]; then
+    driver="goldendb"
+    log "patching ${cfg} for external GoldenDB: ${CUBE_EXTERNAL_GOLDENDB_ADDRS}/${CUBE_EXTERNAL_GOLDENDB_DB:-cube_mvp}"
+    # GoldenDB keeps the CN list in addr verbatim; the driver splits it. The
+    # per-engine mode/proxy settings go into the goldendb: sub-block.
+    patch_cubemaster_instance_db_config "${cfg}" "${driver}" \
+      "${CUBE_EXTERNAL_GOLDENDB_ADDRS}" \
+      "${CUBE_EXTERNAL_GOLDENDB_USER:-cube}" \
+      "${CUBE_EXTERNAL_GOLDENDB_PASSWORD:-}" \
+      "${CUBE_EXTERNAL_GOLDENDB_DB:-cube_mvp}"
+    upsert_conf_goldendb_block "${cfg}"
   else
     driver="mysql"
     log "patching ${cfg} for external MySQL: ${CUBE_EXTERNAL_MYSQL_HOST}:${CUBE_EXTERNAL_MYSQL_PORT:-3306}/${CUBE_EXTERNAL_MYSQL_DB:-cube_mvp}"
@@ -1358,6 +1533,7 @@ patch_conf_external_instance_db() {
       "${CUBE_EXTERNAL_MYSQL_USER:-cube}" \
       "${CUBE_EXTERNAL_MYSQL_PASSWORD:-}" \
       "${CUBE_EXTERNAL_MYSQL_DB:-cube_mvp}"
+    remove_conf_goldendb_block "${cfg}"
   fi
 
   block="$(sed -n '/^instance_db_config:/,/^[^[:space:]#]/p' "${cfg}")"
@@ -1366,21 +1542,22 @@ patch_conf_external_instance_db() {
 }
 
 # one_click_skip_local_mysql is true when an external DB endpoint is configured.
-# Key off host presence (not bare CUBE_DATABASE_DRIVER): driver=postgres with an
-# empty host must not skip bundled MySQL if this env is later reused on control.
+# Key off endpoint presence (not bare CUBE_DATABASE_DRIVER): driver=postgres or
+# goldendb with an empty endpoint must not skip bundled MySQL if this env is
+# later reused on control.
 one_click_skip_local_mysql() {
-  [[ -n "${CUBE_EXTERNAL_MYSQL_HOST:-}" || -n "${CUBE_EXTERNAL_POSTGRES_HOST:-}" ]]
+  [[ -n "${CUBE_EXTERNAL_MYSQL_HOST:-}" || -n "${CUBE_EXTERNAL_POSTGRES_HOST:-}" || -n "${CUBE_EXTERNAL_GOLDENDB_ADDRS:-}" ]]
 }
 
-# validate_one_click_database_config mirrors Helm database.driver / postgres.*:
-# mysql keeps bundled or CUBE_EXTERNAL_MYSQL_*; postgres is external-only and
-# requires CUBE_EXTERNAL_POSTGRES_HOST. Engines do not share host/credential keys.
+# validate_one_click_database_config mirrors Helm database.driver / postgres.*
+# / goldendb.*: mysql keeps bundled or CUBE_EXTERNAL_MYSQL_*; postgres and
+# goldendb are external-only. Engines do not share host/credential keys.
 validate_one_click_database_config() {
   local driver="${CUBE_DATABASE_DRIVER:-mysql}"
   case "${driver}" in
-    mysql|postgres) ;;
+    mysql|postgres|goldendb) ;;
     *)
-      die "CUBE_DATABASE_DRIVER must be mysql or postgres (got '${driver}')"
+      die "CUBE_DATABASE_DRIVER must be mysql, postgres or goldendb (got '${driver}')"
       ;;
   esac
   CUBE_DATABASE_DRIVER="${driver}"
@@ -1396,9 +1573,22 @@ validate_one_click_database_config() {
     if [[ -z "${CUBE_EXTERNAL_POSTGRES_HOST:-}" ]]; then
       die "CUBE_DATABASE_DRIVER=postgres requires CUBE_EXTERNAL_POSTGRES_HOST (one-click never ships a local PostgreSQL)"
     fi
+  elif [[ "${driver}" == "goldendb" ]]; then
+    if [[ -n "${CUBE_EXTERNAL_MYSQL_HOST:-}" ]]; then
+      die "CUBE_DATABASE_DRIVER=goldendb cannot be combined with CUBE_EXTERNAL_MYSQL_HOST"
+    fi
+    if [[ -n "${CUBE_EXTERNAL_POSTGRES_HOST:-}" ]]; then
+      die "CUBE_DATABASE_DRIVER=goldendb cannot be combined with CUBE_EXTERNAL_POSTGRES_HOST"
+    fi
+    if [[ -z "${CUBE_EXTERNAL_GOLDENDB_ADDRS:-}" ]]; then
+      die "CUBE_DATABASE_DRIVER=goldendb requires CUBE_EXTERNAL_GOLDENDB_ADDRS (one-click never ships a local GoldenDB)"
+    fi
   else
     if [[ -n "${CUBE_EXTERNAL_POSTGRES_HOST:-}" ]]; then
       die "CUBE_EXTERNAL_POSTGRES_HOST requires CUBE_DATABASE_DRIVER=postgres"
+    fi
+    if [[ -n "${CUBE_EXTERNAL_GOLDENDB_ADDRS:-}" ]]; then
+      die "CUBE_EXTERNAL_GOLDENDB_ADDRS requires CUBE_DATABASE_DRIVER=goldendb"
     fi
   fi
 }
@@ -1442,7 +1632,41 @@ persist_one_click_database_runtime_env() {
       CUBE_EXTERNAL_MYSQL_PORT \
       CUBE_EXTERNAL_MYSQL_USER \
       CUBE_EXTERNAL_MYSQL_PASSWORD \
-      CUBE_EXTERNAL_MYSQL_DB
+      CUBE_EXTERNAL_MYSQL_DB \
+      CUBE_EXTERNAL_GOLDENDB_ADDRS \
+      CUBE_EXTERNAL_GOLDENDB_USER \
+      CUBE_EXTERNAL_GOLDENDB_PASSWORD \
+      CUBE_EXTERNAL_GOLDENDB_DB \
+      CUBE_EXTERNAL_GOLDENDB_MODE \
+      CUBE_EXTERNAL_GOLDENDB_PROXY_GROUPS \
+      CUBE_EXTERNAL_GOLDENDB_MIN_CONNECTION_PROXYS
+  elif [[ "${driver}" == "goldendb" ]]; then
+    # GoldenDB has no URL form: its endpoint is a comma-separated CN list, which
+    # a mysql:// URL cannot carry. CubeOps reads CUBE_GOLDENDB_* instead, so
+    # DATABASE_URL is deleted rather than pointed at a single CN.
+    upsert_env_kv "${env_file}" "CUBE_EXTERNAL_GOLDENDB_ADDRS" "${CUBE_EXTERNAL_GOLDENDB_ADDRS}"
+    upsert_env_kv "${env_file}" "CUBE_EXTERNAL_GOLDENDB_USER" "${CUBE_EXTERNAL_GOLDENDB_USER:-cube}"
+    upsert_env_kv "${env_file}" "CUBE_EXTERNAL_GOLDENDB_PASSWORD" "${CUBE_EXTERNAL_GOLDENDB_PASSWORD:-}"
+    upsert_env_kv "${env_file}" "CUBE_EXTERNAL_GOLDENDB_DB" "${CUBE_EXTERNAL_GOLDENDB_DB:-cube_mvp}"
+    upsert_env_kv "${env_file}" "CUBE_EXTERNAL_GOLDENDB_MODE" "${CUBE_EXTERNAL_GOLDENDB_MODE:-masterslave}"
+    if [[ -n "${CUBE_EXTERNAL_GOLDENDB_PROXY_GROUPS:-}" ]]; then
+      upsert_env_kv "${env_file}" "CUBE_EXTERNAL_GOLDENDB_PROXY_GROUPS" "${CUBE_EXTERNAL_GOLDENDB_PROXY_GROUPS}"
+    fi
+    if [[ -n "${CUBE_EXTERNAL_GOLDENDB_MIN_CONNECTION_PROXYS:-}" ]]; then
+      upsert_env_kv "${env_file}" "CUBE_EXTERNAL_GOLDENDB_MIN_CONNECTION_PROXYS" "${CUBE_EXTERNAL_GOLDENDB_MIN_CONNECTION_PROXYS}"
+    fi
+    remove_env_kv "${env_file}" "DATABASE_URL"
+    _remove_env_keys "${env_file}" \
+      CUBE_EXTERNAL_MYSQL_HOST \
+      CUBE_EXTERNAL_MYSQL_PORT \
+      CUBE_EXTERNAL_MYSQL_USER \
+      CUBE_EXTERNAL_MYSQL_PASSWORD \
+      CUBE_EXTERNAL_MYSQL_DB \
+      CUBE_EXTERNAL_POSTGRES_HOST \
+      CUBE_EXTERNAL_POSTGRES_PORT \
+      CUBE_EXTERNAL_POSTGRES_USER \
+      CUBE_EXTERNAL_POSTGRES_PASSWORD \
+      CUBE_EXTERNAL_POSTGRES_DB
   elif [[ -n "${CUBE_EXTERNAL_MYSQL_HOST:-}" ]]; then
     upsert_env_kv "${env_file}" "CUBE_EXTERNAL_MYSQL_HOST" "${CUBE_EXTERNAL_MYSQL_HOST}"
     upsert_env_kv "${env_file}" "CUBE_EXTERNAL_MYSQL_PORT" "${CUBE_EXTERNAL_MYSQL_PORT:-3306}"
@@ -1461,7 +1685,14 @@ persist_one_click_database_runtime_env() {
       CUBE_EXTERNAL_POSTGRES_PORT \
       CUBE_EXTERNAL_POSTGRES_USER \
       CUBE_EXTERNAL_POSTGRES_PASSWORD \
-      CUBE_EXTERNAL_POSTGRES_DB
+      CUBE_EXTERNAL_POSTGRES_DB \
+      CUBE_EXTERNAL_GOLDENDB_ADDRS \
+      CUBE_EXTERNAL_GOLDENDB_USER \
+      CUBE_EXTERNAL_GOLDENDB_PASSWORD \
+      CUBE_EXTERNAL_GOLDENDB_DB \
+      CUBE_EXTERNAL_GOLDENDB_MODE \
+      CUBE_EXTERNAL_GOLDENDB_PROXY_GROUPS \
+      CUBE_EXTERNAL_GOLDENDB_MIN_CONNECTION_PROXYS
   else
     local local_mysql_host="127.0.0.1"
     local local_mysql_port="${CUBE_SANDBOX_MYSQL_PORT:-3306}"
@@ -1480,7 +1711,14 @@ persist_one_click_database_runtime_env() {
       CUBE_EXTERNAL_POSTGRES_PORT \
       CUBE_EXTERNAL_POSTGRES_USER \
       CUBE_EXTERNAL_POSTGRES_PASSWORD \
-      CUBE_EXTERNAL_POSTGRES_DB
+      CUBE_EXTERNAL_POSTGRES_DB \
+      CUBE_EXTERNAL_GOLDENDB_ADDRS \
+      CUBE_EXTERNAL_GOLDENDB_USER \
+      CUBE_EXTERNAL_GOLDENDB_PASSWORD \
+      CUBE_EXTERNAL_GOLDENDB_DB \
+      CUBE_EXTERNAL_GOLDENDB_MODE \
+      CUBE_EXTERNAL_GOLDENDB_PROXY_GROUPS \
+      CUBE_EXTERNAL_GOLDENDB_MIN_CONNECTION_PROXYS
   fi
 }
 

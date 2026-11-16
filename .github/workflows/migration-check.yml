@@ -6,11 +6,13 @@ on:
     paths:
       - 'pkgs/cubedb/migrate/**'
       - '.github/workflows/migration-check.yml'
+      - 'pkgs/third_party/goldendb-go-sql-driver/**'
   push:
     branches: [master]
     paths:
       - 'pkgs/cubedb/migrate/**'
       - '.github/workflows/migration-check.yml'
+      - 'pkgs/third_party/goldendb-go-sql-driver/**'
   workflow_dispatch:
 
 permissions:

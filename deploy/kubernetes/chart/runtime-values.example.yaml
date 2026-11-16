@@ -64,6 +64,18 @@ mysql:
 #   user: postgres
 #   password: "replace-me-pg-password"
 #   database: cube_mvp
+#
+# External GoldenDB instead (also skips built-in MySQL). addrs is a
+# comma-separated CN list; every CN needs its port. CubeOps/CubeAPI take
+# CUBE_GOLDENDB_* from the Secret rather than a DATABASE_URL:
+# database:
+#   driver: goldendb
+# goldendb:
+#   addrs: "10.0.0.11:3306,10.0.0.12:3306"
+#   user: cube
+#   password: "replace-me-goldendb-password"
+#   database: cube_mvp
+#   mode: masterslave   # single | random | masterslave | master_cn
 redis:
   # External native Cluster: leave host/Sentinel empty and use db: 0.
   # clusterNodes: "redis-1.example:6379,redis-2.example:6379,redis-3.example:6379"

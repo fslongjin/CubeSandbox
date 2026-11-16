@@ -24,6 +24,8 @@ log:
 
 # TC migrates the same CubeDB as CubeMaster (whichever process wins the lock
 # applies the schema). These credentials must therefore match CubeMaster's.
+# For a goldendb deployment, addr is the same comma-separated CN list and the
+# goldendb block must match CubeMaster's too.
 instance_db_config:
   addr: "127.0.0.1:__CUBE_SANDBOX_MYSQL_PORT__"
   user: "__CUBE_SANDBOX_MYSQL_USER__"

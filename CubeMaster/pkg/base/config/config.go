@@ -174,6 +174,34 @@ type DBConfig struct {
 	// MigrationLockTimeoutSeconds bounds the cluster-wide GET_LOCK wait
 	// at startup. Defaults to 60 seconds when zero.
 	MigrationLockTimeoutSeconds int `yaml:"migration_lock_timeout_seconds"`
+
+	// GoldenDB carries the settings only the goldendb driver understands.
+	// It is read when Driver == "goldendb" and mapped into dao.Config.Extra;
+	// the other engines ignore it. Addr above then holds the comma-separated
+	// CN list instead of a single host:port.
+	GoldenDB *GoldenDBConfig `yaml:"goldendb"`
+}
+
+// GoldenDBConfig holds GoldenDB-only connection options. Field names mirror
+// the driver's Extra keys; pkgs/cubedb/dao/driver/goldendb documents each one.
+type GoldenDBConfig struct {
+	// Mode is single, random, masterslave or master_cn. Empty means
+	// masterslave, which keeps schema migration on the master CN.
+	Mode string `yaml:"mode"`
+	// BlackListMS blacklists a failing CN for this many milliseconds. Zero
+	// leaves the driver default; -1 disables the blacklist.
+	BlackListMS *int64 `yaml:"blacklist_ms"`
+	// MasterBlackListMS is the master CN variant of BlackListMS.
+	MasterBlackListMS *int64 `yaml:"master_blacklist_ms"`
+	// ProxyGroups lists priority groups, highest priority first. Each entry
+	// is a comma-separated list of host:port members.
+	ProxyGroups []string `yaml:"proxy_groups"`
+	// MinConnectionProxys is the number of healthy CNs a group needs before
+	// the next group participates. Zero means driver default.
+	MinConnectionProxys int `yaml:"min_connection_proxys"`
+	// ColumnsNameToLower lowercases result-set column names. nil means the
+	// driver default (true).
+	ColumnsNameToLower *bool `yaml:"columns_name_to_lower"`
 }
 
 type ExtraConf struct {

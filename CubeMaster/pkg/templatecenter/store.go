@@ -14,7 +14,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/go-sql-driver/mysql"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/config"
@@ -36,6 +35,7 @@ import (
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/service/sandbox"
 	sandboxtypes "github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/service/sandbox/types"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/task"
+	"github.com/tencentcloud/CubeSandbox/pkgs/cubedb/dberr"
 	cubeboxv1 "github.com/tencentcloud/CubeSandbox/pkgs/proto/services/cubebox/v1"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -1682,10 +1682,10 @@ func getTemplateByAliasFilteredTx(tx *gorm.DB, alias string, excludeDeleting boo
 
 // isDuplicateAliasError returns true for MySQL (1062) and PostgreSQL (23505)
 // unique-violation errors, using structured type assertions instead of string
-// matching to avoid false positives from unrelated error text.
+// matching to avoid false positives from unrelated error text. dberr covers
+// both linked MySQL drivers (upstream "mysql" and vendored "goldendb").
 func isDuplicateAliasError(err error) bool {
-	var mysqlErr *mysql.MySQLError
-	if errors.As(err, &mysqlErr) && mysqlErr.Number == 1062 {
+	if dberr.IsDuplicateEntry(err) {
 		return true
 	}
 	var pgErr *pgconn.PgError
@@ -1695,10 +1695,9 @@ func isDuplicateAliasError(err error) bool {
 // isDeadlockError reports transient lock errors worth one retry in the alias
 // release+claim transaction: InnoDB deadlock (1213) / lock-wait-timeout (1205),
 // and the PostgreSQL equivalents 40P01 (deadlock_detected) / 55P03
-// (lock_not_available).
+// (lock_not_available). dberr covers both linked MySQL drivers.
 func isDeadlockError(err error) bool {
-	var mysqlErr *mysql.MySQLError
-	if errors.As(err, &mysqlErr) && (mysqlErr.Number == 1205 || mysqlErr.Number == 1213) {
+	if dberr.IsLockConflict(err) {
 		return true
 	}
 	var pgErr *pgconn.PgError

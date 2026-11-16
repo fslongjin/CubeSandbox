@@ -10,6 +10,7 @@ import (
 	"github.com/tencentcloud/CubeSandbox/CubeOps/internal/crypto"
 	"github.com/tencentcloud/CubeSandbox/CubeOps/internal/logging"
 	"github.com/tencentcloud/CubeSandbox/pkgs/cubedb/dao"
+	"github.com/tencentcloud/CubeSandbox/pkgs/cubedb/dao/driver/goldendb"
 	"github.com/tencentcloud/CubeSandbox/pkgs/cubedb/dao/driver/mysql"
 	"github.com/tencentcloud/CubeSandbox/pkgs/cubedb/dao/driver/postgres"
 	"github.com/tencentcloud/CubeSandbox/pkgs/cubedb/migrate"
@@ -23,7 +24,8 @@ type Store struct {
 
 // New opens the database connection, runs migrations, and bootstraps the master key.
 func New(ctx context.Context, cfg dao.Config) (*Store, error) {
-	// Register the MySQL + PostgreSQL drivers (idempotent via init()).
+	// Register the MySQL, GoldenDB and PostgreSQL drivers (idempotent via init()).
+	_ = goldendb.DriverName
 	_ = mysql.DriverName
 	_ = postgres.DriverName
 

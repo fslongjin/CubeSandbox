@@ -34,6 +34,21 @@ jwt_secret: ""                  # JWT_SECRET; leave empty to auto-generate on fi
 # Either (a) or (b) may be set in this YAML or via env (DATABASE_URL /
 # CUBE_SANDBOX_MYSQL_*); env wins. If neither form is set, CubeOps fails
 # at startup.
+#
+# (c) GoldenDB takes precedence over (a) and (b) when addrs is non-empty. A
+#     GoldenDB endpoint is a comma-separated CN list, which no single-host URL
+#     can express, so it has its own keys:
+# goldendb:
+#   addrs: "10.0.0.11:3306,10.0.0.12:3306"  # CUBE_GOLDENDB_ADDRS
+#   user: "REPLACE_ME"                      # CUBE_GOLDENDB_USER
+#   password: "REPLACE_ME"                  # CUBE_GOLDENDB_PASSWORD
+#   db: "REPLACE_ME"                        # CUBE_GOLDENDB_DB
+#   # single | random | masterslave | master_cn. masterslave (the default)
+#   # keeps schema migration on the master CN.
+#   mode: "masterslave"                     # CUBE_GOLDENDB_MODE
+#   # Priority groups, highest first; each is a comma-separated host:port list.
+#   proxy_groups: []
+#   min_connection_proxys: 0
 
 # --- JWT ---
 # Access tokens are short-lived; refresh tokens are long-lived.

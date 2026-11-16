@@ -65,6 +65,16 @@ var dialectSpecs = map[string]dialectSpec{
 		subdir:  "migrations/mysql",
 		store:   &mysqlFingerprintStore{},
 	},
+	// GoldenDB speaks the MySQL wire protocol and shares the schema, so it
+	// reuses the MySQL migration set and fingerprint table verbatim. Keeping
+	// one history means a deployment can move between the two engines without
+	// a second set of SQL files drifting out of sync.
+	"goldendb": {
+		dialect: database.DialectMySQL,
+		rootFS:  mysqlMigrations,
+		subdir:  "migrations/mysql",
+		store:   &mysqlFingerprintStore{},
+	},
 	"postgres": {
 		dialect: database.DialectPostgres,
 		rootFS:  postgresMigrations,

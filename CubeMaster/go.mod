@@ -39,6 +39,7 @@ require (
 	github.com/tencentcloud/CubeSandbox/pkgs/proto v0.0.0
 	github.com/tencentcloud/CubeSandbox/pkgs/sandboxrestart v0.0.0-00010101000000-000000000000
 	github.com/tencentcloud/CubeSandbox/pkgs/snapshotmode v0.0.0
+	github.com/tencentcloud/CubeSandbox/pkgs/third_party/goldendb-go-sql-driver v0.0.0-00010101000000-000000000000
 	github.com/urfave/cli v1.22.15
 	golang.org/x/exp v0.0.0-20260410095643-746e56fc9e2f
 	golang.org/x/sync v0.22.0
@@ -206,3 +207,5 @@ replace github.com/tencentcloud/CubeSandbox/pkgs/sandboxrestart => ../pkgs/sandb
 replace github.com/tencentcloud/CubeSandbox/pkgs/redisx => ../pkgs/redisx
 
 replace github.com/tencentcloud/CubeSandbox/pkgs/snapshotmode => ../pkgs/snapshotmode
+
+replace github.com/tencentcloud/CubeSandbox/pkgs/third_party/goldendb-go-sql-driver => ../pkgs/third_party/goldendb-go-sql-driver

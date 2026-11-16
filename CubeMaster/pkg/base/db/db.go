@@ -10,6 +10,7 @@ import (
 
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/config"
 	"github.com/tencentcloud/CubeSandbox/pkgs/cubedb/dao"
+	"github.com/tencentcloud/CubeSandbox/pkgs/cubedb/dao/driver/goldendb"
 	"gorm.io/gorm"
 )
 
@@ -45,5 +46,24 @@ func ConfigFromDBConfig(src *config.DBConfig) (dao.Config, error) {
 		MaxOpenConns:                src.MaxOpenConns,
 		MaxConnLifeTimeSeconds:      src.MaxConnLifeTimeSeconds,
 		MigrationLockTimeoutSeconds: src.MigrationLockTimeoutSeconds,
+		Extra:                       EngineExtra(src),
 	}, nil
+}
+
+// EngineExtra translates the engine-specific yaml block into the Extra map
+// the dao driver reads. Today only GoldenDB needs one; other engines get nil
+// so their config identity stays exactly as before.
+func EngineExtra(src *config.DBConfig) map[string]string {
+	if src == nil || src.GoldenDB == nil {
+		return nil
+	}
+	g := src.GoldenDB
+	return goldendb.Settings{
+		Mode:                g.Mode,
+		BlackListMS:         g.BlackListMS,
+		MasterBlackListMS:   g.MasterBlackListMS,
+		ProxyGroups:         g.ProxyGroups,
+		MinConnectionProxys: g.MinConnectionProxys,
+		ColumnsNameToLower:  g.ColumnsNameToLower,
+	}.Extra()
 }

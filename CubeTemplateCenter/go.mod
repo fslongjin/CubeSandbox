@@ -14,6 +14,7 @@ require (
 	github.com/tencentcloud/CubeSandbox/pkgs/CubeLog v0.1.1-0.20260113105508-a996703fa42f
 	github.com/tencentcloud/CubeSandbox/pkgs/blobstore v0.0.0
 	github.com/tencentcloud/CubeSandbox/pkgs/cubedb v0.0.0-00010101000000-000000000000
+	github.com/tencentcloud/CubeSandbox/pkgs/third_party/goldendb-go-sql-driver v0.0.0-00010101000000-000000000000 // indirect
 	golang.org/x/oauth2 v0.36.0
 	golang.org/x/sync v0.22.0
 	golang.org/x/sys v0.47.0
@@ -158,3 +159,5 @@ replace github.com/tencentcloud/CubeSandbox/pkgs/snapshotmode => ../pkgs/snapsho
 replace cloud.google.com/go/compute/metadata => cloud.google.com/go/compute/metadata v0.9.0
 
 replace github.com/tencentcloud/CubeSandbox/pkgs/redisx => ../pkgs/redisx
+
+replace github.com/tencentcloud/CubeSandbox/pkgs/third_party/goldendb-go-sql-driver => ../pkgs/third_party/goldendb-go-sql-driver

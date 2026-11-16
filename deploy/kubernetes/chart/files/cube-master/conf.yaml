@@ -69,10 +69,37 @@ req_template_conf:
 
 instance_db_config:
   driver: {{ include "cube.dbDriver" . | quote }}
+  {{- if eq (include "cube.dbDriver" .) "goldendb" }}
+  # GoldenDB: addr is the comma-separated CN list; every CN carries its port.
+  addr: {{ include "cube.dbHost" . | quote }}
+  {{- else }}
   addr: {{ printf "%s:%v" (include "cube.dbHost" .) (include "cube.dbPort" .) | quote }}
+  {{- end }}
   user: {{ include "cube.dbUser" . | quote }}
   pwd: {{ include "cube.dbPassword" . | quote }}
   db_name: {{ include "cube.dbName" . | quote }}
+  {{- if eq (include "cube.dbDriver" .) "goldendb" }}
+  goldendb:
+    mode: {{ include "cube.goldendbMode" . | quote }}
+    {{- with include "cube.goldendbProxyGroups" . }}
+    proxy_groups:
+      {{- range splitList ";" . }}
+      - {{ . | quote }}
+      {{- end }}
+    {{- end }}
+    {{- if .Values.goldendb.minConnectionProxys }}
+    min_connection_proxys: {{ .Values.goldendb.minConnectionProxys }}
+    {{- end }}
+    {{- if ne (toString (((.Values.goldendb).blacklistMs) | default "")) "" }}
+    blacklist_ms: {{ .Values.goldendb.blacklistMs }}
+    {{- end }}
+    {{- if ne (toString (((.Values.goldendb).masterBlacklistMs) | default "")) "" }}
+    master_blacklist_ms: {{ .Values.goldendb.masterBlacklistMs }}
+    {{- end }}
+    {{- if ne (toString (((.Values.goldendb).columnsNameToLower) | default "")) "" }}
+    columns_name_to_lower: {{ .Values.goldendb.columnsNameToLower }}
+    {{- end }}
+  {{- end }}
   conn_timeout: 5
   read_timeout: 5
   write_timeout: 5

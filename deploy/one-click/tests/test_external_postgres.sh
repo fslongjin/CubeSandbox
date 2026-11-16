@@ -186,6 +186,7 @@ test_contract_wiring() {
   local cfg="${ONE_CLICK_DIR}/../../configs/single-node/cubemaster.yaml"
   assert_contains "${env_example}" "CUBE_DATABASE_DRIVER=mysql"
   assert_contains "${env_example}" "CUBE_EXTERNAL_POSTGRES_HOST"
+  assert_contains "${env_example}" "CUBE_EXTERNAL_GOLDENDB_ADDRS"
   # Single DRIVER knob (not duplicated inside each engine block).
   local driver_lines
   driver_lines="$(grep -cE '^#?[[:space:]]*CUBE_DATABASE_DRIVER=' "${env_example}" || true)"
@@ -605,6 +606,8 @@ test_skip_local_mysql_predicate_consistency() {
     || fail "helper must key off MYSQL host"
   echo "${helper}" | grep -Fq 'CUBE_EXTERNAL_POSTGRES_HOST' \
     || fail "helper must key off POSTGRES host"
+  echo "${helper}" | grep -Fq 'CUBE_EXTERNAL_GOLDENDB_ADDRS' \
+    || fail "helper must key off GoldenDB addresses"
   echo "${helper}" | grep -q 'CUBE_DATABASE_DRIVER' \
     && fail "helper must not key off bare DRIVER"
   up_support="${ONE_CLICK_DIR}/scripts/one-click/up-support.sh"
@@ -613,6 +616,7 @@ test_skip_local_mysql_predicate_consistency() {
   for f in "${up_support}" "${quickcheck}" "${postcheck}"; do
     grep -Fq 'CUBE_EXTERNAL_MYSQL_HOST' "${f}" || fail "${f}: missing MYSQL host check"
     grep -Fq 'CUBE_EXTERNAL_POSTGRES_HOST' "${f}" || fail "${f}: missing POSTGRES host check"
+    grep -Fq 'CUBE_EXTERNAL_GOLDENDB_ADDRS' "${f}" || fail "${f}: missing GoldenDB address check"
   done
   # skip assignment must not reference bare DRIVER anymore
   ! grep -E 'skip_local_mysql=1|SKIP_LOCAL_MYSQL=1' -A1 -B3 "${up_support}" "${quickcheck}" \

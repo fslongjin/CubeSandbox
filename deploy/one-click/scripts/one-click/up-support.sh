@@ -107,13 +107,14 @@ esac
 # container is never launched.
 CUBE_EXTERNAL_MYSQL_HOST="${CUBE_EXTERNAL_MYSQL_HOST:-}"
 CUBE_EXTERNAL_POSTGRES_HOST="${CUBE_EXTERNAL_POSTGRES_HOST:-}"
+CUBE_EXTERNAL_GOLDENDB_ADDRS="${CUBE_EXTERNAL_GOLDENDB_ADDRS:-}"
 CUBE_DATABASE_DRIVER="${CUBE_DATABASE_DRIVER:-mysql}"
 CUBE_EXTERNAL_REDIS_HOST="${CUBE_EXTERNAL_REDIS_HOST:-}"
 CUBE_EXTERNAL_REDIS_MASTER_NAME="${CUBE_EXTERNAL_REDIS_MASTER_NAME:-}"
 CUBE_SANDBOX_MINIO_ENABLED="${CUBE_SANDBOX_MINIO_ENABLED:-1}"
-# Skip bundled MySQL only when an external DB host is configured.
+# Skip bundled MySQL only when an external DB endpoint is configured.
 skip_local_mysql=0
-if [[ -n "${CUBE_EXTERNAL_MYSQL_HOST}" || -n "${CUBE_EXTERNAL_POSTGRES_HOST}" ]]; then
+if [[ -n "${CUBE_EXTERNAL_MYSQL_HOST}" || -n "${CUBE_EXTERNAL_POSTGRES_HOST}" || -n "${CUBE_EXTERNAL_GOLDENDB_ADDRS}" ]]; then
   skip_local_mysql=1
 fi
 minio_dropped=0
@@ -131,6 +132,8 @@ if [[ "${skip_local_mysql}" -eq 1 || -n "${CUBE_EXTERNAL_REDIS_HOST}" \
         if [[ "${skip_local_mysql}" -eq 1 ]]; then
           if [[ -n "${CUBE_EXTERNAL_POSTGRES_HOST}" ]]; then
             log "using external PostgreSQL (${CUBE_EXTERNAL_POSTGRES_HOST}), skipping local mysql container"
+          elif [[ -n "${CUBE_EXTERNAL_GOLDENDB_ADDRS}" ]]; then
+            log "using external GoldenDB (${CUBE_EXTERNAL_GOLDENDB_ADDRS}), skipping local mysql container"
           else
             log "using external MySQL (${CUBE_EXTERNAL_MYSQL_HOST}), skipping local mysql container"
           fi

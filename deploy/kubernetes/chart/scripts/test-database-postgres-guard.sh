@@ -110,7 +110,7 @@ if helm template db-driver-bad "$CHART_DIR" $COMMON_SETS \
   echo "expected fail for invalid database.driver" >&2
   exit 1
 fi
-grep -qi 'database.driver must be mysql or postgres' "$TMP_DIR/bad.err" || {
+grep -qi 'database.driver must be mysql, postgres or goldendb' "$TMP_DIR/bad.err" || {
   echo "unexpected error for invalid driver:" >&2
   cat "$TMP_DIR/bad.err" >&2
   exit 1
@@ -210,8 +210,138 @@ if awk '
   exit 1
 fi
 
+# GoldenDB: external-only CN list, no built-in StatefulSet, no single-host
+# DATABASE_URL or MYSQL_* anywhere, and the CN list survives into CubeMaster's
+# config unchanged.
+helm template db-driver-goldendb "$CHART_DIR" $COMMON_SETS \
+  --set-string database.driver=goldendb \
+  --set-string 'goldendb.addrs=10.0.0.11:3306\,10.0.0.12:3306' \
+  --set-string goldendb.user=cube \
+  --set-string goldendb.password=goldendbpw \
+  --set-string goldendb.database=cube_mvp \
+  > "$TMP_DIR/goldendb.yaml"
+
+grep -q 'driver: "goldendb"' "$TMP_DIR/goldendb.yaml" || {
+  echo "goldendb render missing driver: goldendb in CubeMaster config" >&2
+  exit 1
+}
+grep -q 'addr: "10.0.0.11:3306,10.0.0.12:3306"' "$TMP_DIR/goldendb.yaml" || {
+  echo "goldendb render must keep the comma-separated CN list in instance_db_config.addr" >&2
+  exit 1
+}
+# The CN list must not be collapsed to "host:port" of a single host.
+if grep -q 'addr: "10.0.0.11:3306:0"' "$TMP_DIR/goldendb.yaml"; then
+  echo "goldendb addr was rendered as printf host:port of the CN list" >&2
+  exit 1
+fi
+if grep -q 'mode: "masterslave"' "$TMP_DIR/goldendb.yaml"; then
+  : # default mode is present as expected
+else
+  echo "goldendb render must default to mode masterslave" >&2
+  exit 1
+fi
+
+extract_component_doc ops "$TMP_DIR/goldendb.yaml" "$TMP_DIR/goldendb-ops.yaml"
+grep -q 'name: CUBE_GOLDENDB_ADDRS' "$TMP_DIR/goldendb-ops.yaml" || {
+  echo "goldendb CubeOps must receive CUBE_GOLDENDB_ADDRS" >&2
+  exit 1
+}
+grep -q 'key: goldendb-password' "$TMP_DIR/goldendb-ops.yaml" || {
+  echo "goldendb CubeOps password must come from the goldendb-password Secret key" >&2
+  exit 1
+}
+for forbidden in DATABASE_URL CUBE_SANDBOX_MYSQL_HOST; do
+  if grep -q "name: $forbidden" "$TMP_DIR/goldendb-ops.yaml"; then
+    echo "goldendb CubeOps must not set $forbidden" >&2
+    exit 1
+  fi
+done
+if grep -q 'goldendbpw' "$TMP_DIR/goldendb-ops.yaml"; then
+  echo "goldendb CubeOps must not embed the password in the Deployment env" >&2
+  exit 1
+fi
+
+extract_component_doc api "$TMP_DIR/goldendb.yaml" "$TMP_DIR/goldendb-api.yaml"
+if grep -qE 'name: (DATABASE_URL|CUBE_SANDBOX_MYSQL_HOST|CUBE_GOLDENDB_ADDRS)' "$TMP_DIR/goldendb-api.yaml"; then
+  echo "goldendb CubeAPI must not receive database connection env (it never opens SQL)" >&2
+  exit 1
+fi
+
+extract_kind_doc Secret "$TMP_DIR/goldendb.yaml" "$TMP_DIR/goldendb-secret.yaml"
+grep -q 'goldendb-password: "goldendbpw"' "$TMP_DIR/goldendb-secret.yaml" || {
+  echo "goldendb Secret missing goldendb-password" >&2
+  exit 1
+}
+if grep -qE '^  (mysql-password|mysql-root-password|database-url):' "$TMP_DIR/goldendb-secret.yaml"; then
+  echo "goldendb Secret must not emit mysql-* or database-url keys" >&2
+  exit 1
+fi
+
+if awk '
+  BEGIN { want=0 }
+  /^kind: StatefulSet$/ { want=1; next }
+  want && /app.kubernetes.io\/component: mysql/ { found=1 }
+  /^---$/ { want=0 }
+  END { exit found ? 0 : 1 }
+' "$TMP_DIR/goldendb.yaml"; then
+  echo "goldendb render must skip the built-in MySQL StatefulSet" >&2
+  exit 1
+fi
+
+# goldendb without addrs must fail, and mysql.host must not satisfy it.
+if helm template db-driver-goldendb-noaddrs "$CHART_DIR" $COMMON_SETS \
+  --set-string database.driver=goldendb >/dev/null 2>"$TMP_DIR/goldendb-noaddrs.err"; then
+  echo "expected fail when database.driver=goldendb without goldendb.addrs" >&2
+  exit 1
+fi
+grep -qi 'database.driver=goldendb requires goldendb.addrs' "$TMP_DIR/goldendb-noaddrs.err" || {
+  echo "unexpected error for goldendb without addrs:" >&2
+  cat "$TMP_DIR/goldendb-noaddrs.err" >&2
+  exit 1
+}
+if helm template db-driver-goldendb-crossref "$CHART_DIR" $COMMON_SETS \
+  --set-string database.driver=goldendb \
+  --set-string mysql.host=10.0.0.12 >/dev/null 2>"$TMP_DIR/goldendb-crossref.err"; then
+  echo "expected fail when only mysql.host is set for the goldendb driver" >&2
+  exit 1
+fi
+grep -qi 'requires goldendb.addrs' "$TMP_DIR/goldendb-crossref.err" || {
+  echo "unexpected error for goldendb with only mysql.host:" >&2
+  cat "$TMP_DIR/goldendb-crossref.err" >&2
+  exit 1
+}
+
+# invalid goldendb.mode must fail.
+if helm template db-driver-goldendb-badmode "$CHART_DIR" $COMMON_SETS \
+  --set-string database.driver=goldendb \
+  --set-string goldendb.addrs=10.0.0.11:3306 \
+  --set-string goldendb.password=goldendbpw \
+  --set-string goldendb.mode=quorum >/dev/null 2>"$TMP_DIR/goldendb-badmode.err"; then
+  echo "expected fail for an invalid goldendb.mode" >&2
+  exit 1
+fi
+grep -qi 'goldendb.mode must be' "$TMP_DIR/goldendb-badmode.err" || {
+  echo "unexpected error for invalid goldendb.mode:" >&2
+  cat "$TMP_DIR/goldendb-badmode.err" >&2
+  exit 1
+}
+
+# goldendb.addrs with the CHANGE_ME password must fail.
+if helm template db-driver-goldendb-changeme "$CHART_DIR" $COMMON_SETS \
+  --set-string database.driver=goldendb \
+  --set-string goldendb.addrs=10.0.0.11:3306 >/dev/null 2>"$TMP_DIR/goldendb-changeme.err"; then
+  echo "expected fail when goldendb.addrs is set with CHANGE_ME password" >&2
+  exit 1
+fi
+grep -qi 'CHANGE_ME' "$TMP_DIR/goldendb-changeme.err" || {
+  echo "unexpected error for CHANGE_ME with goldendb.addrs:" >&2
+  cat "$TMP_DIR/goldendb-changeme.err" >&2
+  exit 1
+}
+
 echo "ok: default mysql driver keeps MYSQL_* and built-in StatefulSet"
 echo "ok: external mysql.host keeps working and skips the built-in StatefulSet"
 echo "ok: postgres without postgres.host / mysql.host only / invalid driver / CHANGE_ME fail as expected"
 echo "ok: postgres + host sets CubeMaster/CubeOps/CubeAPI DATABASE_URL via Secret (port 5432 default)"
+echo "ok: goldendb keeps the CN list, uses CUBE_GOLDENDB_*, and skips built-in MySQL"
 echo "All database.driver guard tests passed"

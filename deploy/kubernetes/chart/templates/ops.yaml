@@ -133,6 +133,42 @@ spec:
                 secretKeyRef:
                   name: {{ include "cube.secretName" . }}
                   key: database-url
+            {{- else if eq (include "cube.dbDriver" .) "goldendb" }}
+            # GoldenDB needs a comma-separated CN list, which no DATABASE_URL
+            # can carry, so CubeOps takes the split fields instead.
+            - name: CUBE_GOLDENDB_ADDRS
+              value: {{ include "cube.dbHost" . | quote }}
+            - name: CUBE_GOLDENDB_USER
+              value: {{ include "cube.dbUser" . | quote }}
+            - name: CUBE_GOLDENDB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "cube.secretName" . }}
+                  key: goldendb-password
+            - name: CUBE_GOLDENDB_DB
+              value: {{ include "cube.dbName" . | quote }}
+            - name: CUBE_GOLDENDB_MODE
+              value: {{ include "cube.goldendbMode" . | quote }}
+            {{- with include "cube.goldendbProxyGroups" . }}
+            - name: CUBE_GOLDENDB_PROXY_GROUPS
+              value: {{ . | quote }}
+            {{- end }}
+            {{- if ne (toString (((.Values.goldendb).minConnectionProxys) | default 0)) "0" }}
+            - name: CUBE_GOLDENDB_MIN_CONNECTION_PROXYS
+              value: {{ .Values.goldendb.minConnectionProxys | quote }}
+            {{- end }}
+            {{- if ne (toString (((.Values.goldendb).blacklistMs) | default "")) "" }}
+            - name: CUBE_GOLDENDB_BLACKLIST_MS
+              value: {{ .Values.goldendb.blacklistMs | quote }}
+            {{- end }}
+            {{- if ne (toString (((.Values.goldendb).masterBlacklistMs) | default "")) "" }}
+            - name: CUBE_GOLDENDB_MASTER_BLACKLIST_MS
+              value: {{ .Values.goldendb.masterBlacklistMs | quote }}
+            {{- end }}
+            {{- if ne (toString (((.Values.goldendb).columnsNameToLower) | default "")) "" }}
+            - name: CUBE_GOLDENDB_COLUMNS_NAME_TO_LOWER
+              value: {{ .Values.goldendb.columnsNameToLower | quote }}
+            {{- end }}
             {{- else }}
             - name: CUBE_SANDBOX_MYSQL_HOST
               value: {{ include "cube.dbHost" . | quote }}

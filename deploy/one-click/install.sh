@@ -69,11 +69,12 @@ DEPLOY_ROLE="$(one_click_deploy_role)"
 
 # ---- External MySQL / Redis support ----
 # Set CUBE_EXTERNAL_MYSQL_HOST / CUBE_EXTERNAL_POSTGRES_HOST /
-# CUBE_EXTERNAL_REDIS_HOST to use external services instead of the bundled
-# local Docker containers. Defaults are filled after the optional upgrade env
-# merge so they are based on the final runtime configuration.
-# CUBE_DATABASE_DRIVER mirrors Helm database.driver (mysql|postgres); postgres
-# is always external (one-click never ships a local PostgreSQL).
+# CUBE_EXTERNAL_GOLDENDB_ADDRS / CUBE_EXTERNAL_REDIS_HOST to use external
+# services instead of the bundled local Docker containers. Defaults are filled
+# after the optional upgrade env merge so they are based on the final runtime
+# configuration.
+# CUBE_DATABASE_DRIVER mirrors Helm database.driver (mysql|postgres|goldendb);
+# postgres and goldendb are always external (one-click ships neither).
 init_external_dep_defaults() {
   CUBE_DATABASE_DRIVER="${CUBE_DATABASE_DRIVER:-mysql}"
 
@@ -94,6 +95,17 @@ init_external_dep_defaults() {
   CUBE_EXTERNAL_POSTGRES_USER="${CUBE_EXTERNAL_POSTGRES_USER:-cube}"
   CUBE_EXTERNAL_POSTGRES_PASSWORD="${CUBE_EXTERNAL_POSTGRES_PASSWORD:-cube_pass}"
   CUBE_EXTERNAL_POSTGRES_DB="${CUBE_EXTERNAL_POSTGRES_DB:-cube_mvp}"
+
+  # External GoldenDB (CUBE_DATABASE_DRIVER=goldendb). addrs is a
+  # comma-separated CN list with an explicit port on every CN; the other keys
+  # are independent of the MySQL/PostgreSQL ones, same as Helm goldendb.*.
+  CUBE_EXTERNAL_GOLDENDB_ADDRS="${CUBE_EXTERNAL_GOLDENDB_ADDRS:-}"
+  CUBE_EXTERNAL_GOLDENDB_USER="${CUBE_EXTERNAL_GOLDENDB_USER:-cube}"
+  CUBE_EXTERNAL_GOLDENDB_PASSWORD="${CUBE_EXTERNAL_GOLDENDB_PASSWORD:-cube_pass}"
+  CUBE_EXTERNAL_GOLDENDB_DB="${CUBE_EXTERNAL_GOLDENDB_DB:-cube_mvp}"
+  CUBE_EXTERNAL_GOLDENDB_MODE="${CUBE_EXTERNAL_GOLDENDB_MODE:-masterslave}"
+  CUBE_EXTERNAL_GOLDENDB_PROXY_GROUPS="${CUBE_EXTERNAL_GOLDENDB_PROXY_GROUPS:-}"
+  CUBE_EXTERNAL_GOLDENDB_MIN_CONNECTION_PROXYS="${CUBE_EXTERNAL_GOLDENDB_MIN_CONNECTION_PROXYS:-}"
 
   # Mirrors the MySQL behaviour above (patch conf.yaml, persist env, mask local
   # redis unit).
@@ -147,6 +159,10 @@ warn_default_external_credentials() {
   if [[ -n "${CUBE_EXTERNAL_POSTGRES_HOST}" && "${CUBE_EXTERNAL_POSTGRES_PASSWORD}" == "cube_pass" ]]; then
     log "WARNING: external PostgreSQL (${CUBE_EXTERNAL_POSTGRES_HOST}) configured with the default password 'cube_pass'."
     log "WARNING: set CUBE_EXTERNAL_POSTGRES_PASSWORD to a strong value in your .env before exposing this deployment."
+  fi
+  if [[ -n "${CUBE_EXTERNAL_GOLDENDB_ADDRS}" && "${CUBE_EXTERNAL_GOLDENDB_PASSWORD}" == "cube_pass" ]]; then
+    log "WARNING: external GoldenDB (${CUBE_EXTERNAL_GOLDENDB_ADDRS}) configured with the default password 'cube_pass'."
+    log "WARNING: set CUBE_EXTERNAL_GOLDENDB_PASSWORD to a strong value in your .env before exposing this deployment."
   fi
   if [[ -n "${CUBE_EXTERNAL_REDIS_HOST}" && "${CUBE_EXTERNAL_REDIS_PASSWORD}" == "ceuhvu123" ]]; then
     log "WARNING: external Redis (${CUBE_EXTERNAL_REDIS_HOST}) configured with the default password 'ceuhvu123'."
@@ -616,6 +632,7 @@ patch_cubemaster_external_deps() {
 
   # Nothing to patch: no external endpoint, no stale Sentinel keys.
   if [[ -z "${CUBE_EXTERNAL_MYSQL_HOST}" && -z "${CUBE_EXTERNAL_POSTGRES_HOST}" \
+      && -z "${CUBE_EXTERNAL_GOLDENDB_ADDRS}" \
       && -z "${CUBE_EXTERNAL_REDIS_HOST}" \
       && -z "${CUBE_EXTERNAL_REDIS_MASTER_NAME}" \
       && -z "${CUBE_EXTERNAL_REDIS_CLUSTER_NODES:-}" \
@@ -764,6 +781,47 @@ EOF
       log "external MySQL connectivity OK"
     else
       log "mysqladmin not found; skipping external MySQL connectivity preflight"
+    fi
+  fi
+
+  if [[ "${DEPLOY_ROLE:-}" != "compute" && -n "${CUBE_EXTERNAL_GOLDENDB_ADDRS}" ]]; then
+    # GoldenDB speaks the MySQL protocol, so mysqladmin checks the first CN.
+    # This validates reachability and credentials against one CN only; the
+    # driver rotates across the rest at runtime.
+    if command -v mysqladmin >/dev/null 2>&1; then
+      local golden_gdb_first_cn golden_gdb_host golden_gdb_port golden_gdb_cnf
+      golden_gdb_first_cn="${CUBE_EXTERNAL_GOLDENDB_ADDRS%%,*}"
+      golden_gdb_first_cn="${golden_gdb_first_cn//[[:space:]]/}"
+      golden_gdb_host="${golden_gdb_first_cn%:*}"
+      golden_gdb_port="${golden_gdb_first_cn##*:}"
+      golden_gdb_host="${golden_gdb_host#[}"; golden_gdb_host="${golden_gdb_host%]}"
+      log "checking connectivity to external GoldenDB ${golden_gdb_host}:${golden_gdb_port} (first CN of ${CUBE_EXTERNAL_GOLDENDB_ADDRS})"
+      local old_umask
+      old_umask="$(umask)"
+      umask 077
+      golden_gdb_cnf="$(mktemp)"
+      umask "${old_umask}"
+      trap 'rm -f "${golden_gdb_cnf}"' EXIT
+      chmod 600 "${golden_gdb_cnf}"
+      cat > "${golden_gdb_cnf}" <<EOF
+[client]
+password="${CUBE_EXTERNAL_GOLDENDB_PASSWORD}"
+EOF
+      if ! mysqladmin --defaults-extra-file="${golden_gdb_cnf}" \
+          -h "${golden_gdb_host}" \
+          -P "${golden_gdb_port}" \
+          -u "${CUBE_EXTERNAL_GOLDENDB_USER}" \
+          --connect-timeout="${connect_timeout}" ping >/dev/null 2>&1; then
+        rm -f "${golden_gdb_cnf}"
+        trap - EXIT
+        die "cannot reach external GoldenDB at ${golden_gdb_host}:${golden_gdb_port} as user '${CUBE_EXTERNAL_GOLDENDB_USER}'.
+  Verify CUBE_EXTERNAL_GOLDENDB_ADDRS / _USER / _PASSWORD and that every CN is reachable from this host."
+      fi
+      rm -f "${golden_gdb_cnf}"
+      trap - EXIT
+      log "external GoldenDB connectivity OK (first CN)"
+    else
+      log "mysqladmin not found; skipping external GoldenDB connectivity preflight"
     fi
   fi
 
@@ -1824,8 +1882,10 @@ mask_local_dep_service() {
 
 mask_external_dep_services() {
   if one_click_skip_local_mysql; then
-    if [[ -n "${CUBE_EXTERNAL_POSTGRES_HOST}" ]]; then
+    if [[ -n "${CUBE_EXTERNAL_POSTGRES_HOST:-}" ]]; then
       log "masking local MySQL service (external PostgreSQL at ${CUBE_EXTERNAL_POSTGRES_HOST} in use)"
+    elif [[ -n "${CUBE_EXTERNAL_GOLDENDB_ADDRS:-}" ]]; then
+      log "masking local MySQL service (external GoldenDB at ${CUBE_EXTERNAL_GOLDENDB_ADDRS} in use)"
     else
       log "masking local MySQL service (external MySQL at ${CUBE_EXTERNAL_MYSQL_HOST} in use)"
     fi

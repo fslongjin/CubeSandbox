@@ -678,10 +678,12 @@ diagnostics:
   enabled: true
 
 # Control-plane database (CubeMaster / CubeOps / CubeAPI) engine selector.
-# The driver decides which section below is read; the other one is ignored.
+# The driver decides which section below is read; the other ones are ignored.
 #   mysql    -> mysql.*    (chart-managed StatefulSet when mysql.host is empty,
 #                           or an external MySQL when mysql.host is set)
 #   postgres -> postgres.* (external only, postgres.host is required)
+#   goldendb -> goldendb.* (external only, goldendb.addrs is required; carries
+#                           a comma-separated GoldenDB CN list)
 database:
   driver: mysql
 
@@ -731,6 +733,31 @@ postgres:
   # SECURITY: same rule as mysql.password; templates/validate.yaml refuses to
   # render while this equals the CHANGE_ME_* sentinel.
   password: CHANGE_ME_POSTGRES_PASSWORD
+
+# External GoldenDB, read only when database.driver=goldendb.
+# The chart never deploys GoldenDB. addrs is a comma-separated CN list and
+# every CN must carry its port, e.g. "10.0.0.11:3306,10.0.0.12:3306".
+goldendb:
+  addrs: ""
+  database: cube_mvp
+  user: cube
+  # SECURITY: same rule as mysql.password; templates/validate.yaml refuses to
+  # render while this equals the CHANGE_ME_* sentinel.
+  password: CHANGE_ME_GOLDENDB_PASSWORD
+  # single | random | masterslave | master_cn. masterslave (default) keeps
+  # schema migration on the master CN; random makes the GET_LOCK migration
+  # lock non-cluster-wide.
+  mode: masterslave
+  # Priority groups, highest first. Each entry is a comma-separated host:port
+  # list, e.g. ["10.0.1.1:3306,10.0.1.2:3306", "10.1.0.1:3306"].
+  proxyGroups: []
+  # Healthy CNs a group needs before the next group participates (0 = default).
+  minConnectionProxys: 0
+  # Blacklist a failing CN for this many milliseconds (-1 disables).
+  blacklistMs: null
+  masterBlacklistMs: null
+  # Lowercase result-set column names (null = driver default, true).
+  columnsNameToLower: null
 
 redis:
   enabled: true

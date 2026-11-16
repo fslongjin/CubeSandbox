@@ -19,6 +19,7 @@ COPY pkgs/cubedb /build/pkgs/cubedb
 COPY pkgs/CubeLog /build/pkgs/CubeLog
 COPY pkgs/blobstore /build/pkgs/blobstore
 COPY pkgs/redisx /build/pkgs/redisx
+COPY pkgs/third_party/goldendb-go-sql-driver /build/pkgs/third_party/goldendb-go-sql-driver
 RUN go mod download
 
 COPY CubeOps/ .

@@ -28,6 +28,7 @@ import (
 	CubeLog "github.com/tencentcloud/CubeSandbox/pkgs/CubeLog"
 	cubeboxv1 "github.com/tencentcloud/CubeSandbox/pkgs/proto/services/cubebox/v1"
 	"github.com/tencentcloud/CubeSandbox/pkgs/snapshotmode"
+	goldendbmysql "github.com/tencentcloud/CubeSandbox/pkgs/third_party/goldendb-go-sql-driver"
 )
 
 func TestCreateSnapshotSuccessResponse(t *testing.T) {
@@ -131,6 +132,18 @@ func TestSnapshotErrorCodeMapsMySQLLockErrorsToDBError(t *testing.T) {
 	for _, err := range []error{
 		&mysql.MySQLError{Number: 1213, Message: "Deadlock found when trying to get lock"},
 		&mysql.MySQLError{Number: 1205, Message: "Lock wait timeout exceeded"},
+	} {
+		assert.Equal(t, int(errorcode.ErrorCode_DBError), snapshotErrorCode(err))
+	}
+}
+
+// The goldendb dao driver links a vendored MySQL fork with its own error type.
+// A structured lock-error match must cover it so a GoldenDB deadlock maps to
+// DBError instead of falling through to a params error.
+func TestSnapshotErrorCodeMapsGoldenDBLockErrorsToDBError(t *testing.T) {
+	for _, err := range []error{
+		&goldendbmysql.MySQLError{Number: 1213, Message: "Deadlock found when trying to get lock"},
+		&goldendbmysql.MySQLError{Number: 1205, Message: "Lock wait timeout exceeded"},
 	} {
 		assert.Equal(t, int(errorcode.ErrorCode_DBError), snapshotErrorCode(err))
 	}

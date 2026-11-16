@@ -24,6 +24,7 @@ import (
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/db/models"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/node"
 	sandboxtypes "github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/service/sandbox/types"
+	goldendbmysql "github.com/tencentcloud/CubeSandbox/pkgs/third_party/goldendb-go-sql-driver"
 	gormmysql "gorm.io/driver/mysql"
 	"gorm.io/gorm"
 )
@@ -1175,6 +1176,23 @@ func TestIsDuplicateAliasErrorMySQLCodes(t *testing.T) {
 	assert.True(t, isDuplicateAliasError(&mysql.MySQLError{Number: 1062, Message: "Duplicate entry"}))
 	assert.True(t, isDuplicateAliasError(fmt.Errorf("wrapped: %w", &mysql.MySQLError{Number: 1062, Message: "Duplicate entry"})))
 	assert.False(t, isDuplicateAliasError(&mysql.MySQLError{Number: 1406, Message: "Data too long"}))
+}
+
+// A goldendb deployment carries the vendored fork's MySQLError, which is a
+// distinct Go type from the upstream driver's. Alias claiming must still see
+// the conflict, otherwise a concurrent claim surfaces as a 500 instead of 409.
+func TestIsDuplicateAliasErrorGoldendbCodes(t *testing.T) {
+	assert.True(t, isDuplicateAliasError(&goldendbmysql.MySQLError{Number: 1062, Message: "Duplicate entry"}))
+	assert.True(t, isDuplicateAliasError(fmt.Errorf("wrapped: %w", &goldendbmysql.MySQLError{Number: 1062, Message: "Duplicate entry"})))
+	assert.False(t, isDuplicateAliasError(&goldendbmysql.MySQLError{Number: 1406, Message: "Data too long"}))
+}
+
+// Same trap for the deadlock retry: a missed goldendb deadlock means the
+// release+claim transaction is never retried.
+func TestIsDeadlockErrorGoldendbCodes(t *testing.T) {
+	assert.True(t, isDeadlockError(&goldendbmysql.MySQLError{Number: 1213, Message: "Deadlock found"}))
+	assert.True(t, isDeadlockError(&goldendbmysql.MySQLError{Number: 1205, Message: "Lock wait timeout exceeded"}))
+	assert.False(t, isDeadlockError(&goldendbmysql.MySQLError{Number: 1062, Message: "Duplicate entry"}))
 }
 
 func TestSyncCreateRedoImageJobAliasTx_NoJobsSucceeds(t *testing.T) {

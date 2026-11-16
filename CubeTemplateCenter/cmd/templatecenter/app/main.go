@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/config"
+	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/db"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/log"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/recov"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/errorcode"
@@ -27,6 +28,7 @@ import (
 	"github.com/tencentcloud/CubeSandbox/CubeTemplateCenter/pkg/tcconfig"
 	CubeLog "github.com/tencentcloud/CubeSandbox/cubelog"
 	"github.com/tencentcloud/CubeSandbox/pkgs/cubedb/dao"
+	_ "github.com/tencentcloud/CubeSandbox/pkgs/cubedb/dao/driver/goldendb" // register goldendb driver
 	_ "github.com/tencentcloud/CubeSandbox/pkgs/cubedb/dao/driver/mysql"    // register mysql driver
 	_ "github.com/tencentcloud/CubeSandbox/pkgs/cubedb/dao/driver/postgres" // register postgres driver
 	"github.com/tencentcloud/CubeSandbox/pkgs/cubedb/migrate"
@@ -222,23 +224,12 @@ func coreInit(ctx context.Context, cfg *config.Config) error {
 // migrations. Mirrors CubeMaster's behavior so the two processes share
 // schema ownership.
 func initDatabaseSchema(ctx context.Context, cfg *config.Config) error {
-	src := cfg.InstanceDBConfig
-	if src == nil {
-		return fmt.Errorf("dao: instance_db_config is not set")
-	}
-	daoCfg := dao.Config{
-		Driver:                      src.Driver,
-		Addr:                        src.Addr,
-		User:                        src.User,
-		Pwd:                         src.Pwd,
-		DBName:                      src.DBName,
-		ConnTimeoutSeconds:          src.ConnTimeout,
-		ReadTimeoutSeconds:          src.ReadTimeout,
-		WriteTimeoutSeconds:         src.WriteTimeout,
-		MaxIdleConns:                src.MaxIdleConns,
-		MaxOpenConns:                src.MaxOpenConns,
-		MaxConnLifeTimeSeconds:      src.MaxConnLifeTimeSeconds,
-		MigrationLockTimeoutSeconds: src.MigrationLockTimeoutSeconds,
+	// Route through db.ConfigFromDBConfig so this process derives the same
+	// dao.Config identity as CubeMaster, including engine-specific settings
+	// such as GoldenDB's connection mode.
+	daoCfg, err := db.ConfigFromDBConfig(cfg.InstanceDBConfig)
+	if err != nil {
+		return fmt.Errorf("dao: %w", err)
 	}
 	if _, err := dao.Open(ctx, daoCfg); err != nil {
 		return fmt.Errorf("dao open: %w", err)

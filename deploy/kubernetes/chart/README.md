@@ -227,7 +227,7 @@ helm upgrade --install cube ./deploy/kubernetes/chart   -n cube-system   --creat
 
 > Do not store SSH passwords or node login credentials in this chart. Host mutation is performed through Kubernetes privileged Pods, not through SSH.
 
-## Use third-party MySQL, PostgreSQL, or Redis
+## Use third-party MySQL, PostgreSQL, GoldenDB, or Redis
 
 `database.driver` picks the control-plane database engine, and each engine keeps its own connection section. The section that does not match the driver is ignored, and no value is inferred across sections.
 
@@ -236,6 +236,7 @@ helm upgrade --install cube ./deploy/kubernetes/chart   -n cube-system   --creat
 | Built-in MySQL (default) | `database.driver: mysql`, `mysql.enabled: true`, `mysql.host: ""` |
 | External MySQL | `database.driver: mysql`, `mysql.host: <addr>` (plus `mysql.port` / `user` / `password` / `database`) |
 | External PostgreSQL | `database.driver: postgres`, `postgres.host: <addr>` (plus `postgres.port` / `user` / `password` / `database`) |
+| External GoldenDB | `database.driver: goldendb`, `goldendb.addrs: <cn-list>` (plus `user` / `password` / `database` / `mode`) |
 
 The chart installs the `cube-mysql` StatefulSet only when the driver is `mysql`, `mysql.enabled=true`, and `mysql.host` is empty. `mysql.rootPassword` is used only by that StatefulSet.
 
@@ -251,6 +252,33 @@ postgres:
   password: "replace-me"
   database: cube_mvp
 ```
+
+GoldenDB is external-only as well: the chart never deploys a GoldenDB cluster, so `goldendb.addrs` is required. `addrs` is a comma-separated CN list and every CN must carry its port; the value is written verbatim into `instance_db_config.addr` and the driver rotates across the CNs. Because a multi-CN list has no single-host URL form, CubeOps and CubeMaster take the split `CUBE_GOLDENDB_*` fields instead of `DATABASE_URL`; CubeAPI never opens this database. `goldendb.mode` selects the connection strategy:
+
+| `goldendb.mode` | Behaviour | Use for |
+| --- | --- | --- |
+| `masterslave` (default) | Detects the master CN from the handshake `master_flag`, falling back to `select @@global.cluster_master_host` | Control plane; keeps schema migration on the master CN |
+| `master_cn` | Always dials the master CN | Strict single-writer setups |
+| `random` | Spreads connections across all CNs | Read-heavy workloads only; the `GET_LOCK` migration lock is then not cluster-wide |
+| `single` | Dials the single configured address, no GoldenDB extensions | Plain single-node endpoints |
+
+```yaml
+database:
+  driver: goldendb
+goldendb:
+  addrs: "10.0.0.11:3306,10.0.0.12:3306"
+  user: cube
+  password: "replace-me"
+  database: cube_mvp
+  mode: masterslave
+  # Optional priority groups, highest first; members keep their explicit port.
+  proxyGroups:
+    - "10.0.1.1:3306,10.0.1.2:3306"
+    - "10.1.0.1:3306"
+  minConnectionProxys: 1
+```
+
+The GoldenDB Go driver is vendored under `pkgs/third_party/goldendb-go-sql-driver` (MPL-2.0) and registered as the `goldendb` `database/sql` driver, so the built-in MySQL path stays on upstream `go-sql-driver/mysql`. GoldenDB reuses the MySQL schema and migration set.
 
 The chart installs the `cube-redis` StatefulSet only when `redis.enabled=true` and no external host, Sentinel master, or Cluster seeds are configured.
 Set `redis.host` to use an existing Redis service; the chart will not install `cube-redis`.
@@ -434,13 +462,13 @@ PVC / LoadBalancer only — it does not set `global.imageRegistry`).
 
 ## Database migration
 
-The chart does not deliver a separate DB migration Job or image. CubeMaster and CubeOps share the `pkgs/cubedb` migrator and apply the embedded SQL under `pkgs/cubedb/migrate/migrations/{mysql,postgres}` at process startup.
+The chart does not deliver a separate DB migration Job or image. CubeMaster and CubeOps share the `pkgs/cubedb` migrator and apply the embedded SQL under `pkgs/cubedb/migrate/migrations/{mysql,postgres}` at process startup. `database.driver=goldendb` reuses the MySQL migration set.
 
 - CubeMaster and CubeOps use the configured database endpoint, user, password, and database.
 - The chart does not package or maintain SQL files under `files/`; do not add migration SQL copies to the chart.
 - Applied versions are recorded in `goose_db_version`. Concurrent migration attempts are serialized by the cluster lock in `pkgs/cubedb`.
 - There is no chart-managed SQL data seed, and the one-click single-node seed file `sql/002_seed_single_node.sql` is intentionally not rendered by the chart. Node registration must come from real Cube Node Pods selected by `placement.compute.nodeSelector`.
-- When using a third-party database, set `mysql.host` or `postgres.host` (matching `database.driver`) and ensure the configured user can create/alter tables in that database.
+- When using a third-party database, set `mysql.host`, `postgres.host` or `goldendb.addrs` (matching `database.driver`) and ensure the configured user can create/alter tables in that database.
 
 ## cubemastercli operational CLI
 

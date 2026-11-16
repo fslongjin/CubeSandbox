@@ -81,3 +81,66 @@ func TestConfigFromDBConfig(t *testing.T) {
 		t.Fatalf("ConfigFromDBConfig mismatch:\n got: %+v\nwant: %+v", got, want)
 	}
 }
+
+// TestConfigFromDBConfigMapsGoldenDB covers the engine block: a goldendb
+// deployment keeps its CN list in Addr and its mode/proxy settings in Extra,
+// which is what dao.Open's identity comparison and the driver both read.
+func TestConfigFromDBConfigMapsGoldenDB(t *testing.T) {
+	blacklist := int64(500)
+	masterBlacklist := int64(-1)
+	lower := false
+	src := &config.DBConfig{
+		Driver: "goldendb",
+		Addr:   "10.0.0.1:3306,10.0.0.2:3306",
+		User:   "cube",
+		Pwd:    "cube_pass",
+		DBName: "cube_mvp",
+		GoldenDB: &config.GoldenDBConfig{
+			Mode:                "master_cn",
+			BlackListMS:         &blacklist,
+			MasterBlackListMS:   &masterBlacklist,
+			ProxyGroups:         []string{"10.0.1.1:3306,10.0.1.2:3306", "10.1.0.1:3306"},
+			MinConnectionProxys: 1,
+			ColumnsNameToLower:  &lower,
+		},
+	}
+	got, err := db.ConfigFromDBConfig(src)
+	if err != nil {
+		t.Fatalf("ConfigFromDBConfig: %v", err)
+	}
+	if got.Driver != "goldendb" {
+		t.Fatalf("Driver = %q", got.Driver)
+	}
+	if got.Addr != "10.0.0.1:3306,10.0.0.2:3306" {
+		t.Fatalf("Addr = %q; the CN list must stay comma separated", got.Addr)
+	}
+	want := map[string]string{
+		"mode":                  "master_cn",
+		"blacklist_ms":          "500",
+		"master_blacklist_ms":   "-1",
+		"proxy_groups":          "10.0.1.1:3306,10.0.1.2:3306;10.1.0.1:3306",
+		"min_connection_proxys": "1",
+		"columns_name_to_lower": "false",
+	}
+	if !reflect.DeepEqual(got.Extra, want) {
+		t.Fatalf("Extra mismatch:\n got: %+v\nwant: %+v", got.Extra, want)
+	}
+}
+
+// TestConfigFromDBConfigIgnoresGoldenDBBlockForOtherEngines keeps plain MySQL
+// and PostgreSQL config identities byte-identical to what they were before the
+// GoldenDB block existed.
+func TestConfigFromDBConfigIgnoresGoldenDBBlockForOtherEngines(t *testing.T) {
+	got, err := db.ConfigFromDBConfig(&config.DBConfig{
+		Driver: "mysql",
+		Addr:   "127.0.0.1:3306",
+		User:   "cube",
+		DBName: "cube_mvp",
+	})
+	if err != nil {
+		t.Fatalf("ConfigFromDBConfig: %v", err)
+	}
+	if got.Extra != nil {
+		t.Fatalf("Extra = %+v, want nil for a plain MySQL config", got.Extra)
+	}
+}

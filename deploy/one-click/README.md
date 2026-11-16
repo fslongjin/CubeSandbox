@@ -423,12 +423,13 @@ During installation, runtime files are prepared in this directory and the follow
 
 Set `CUBE_EXTERNAL_REDIS_CLUSTER_NODES` to comma-separated `host:port` seed endpoints, set `CUBE_EXTERNAL_REDIS_DB=0`, and clear fixed standalone Redis and Sentinel settings. The deployment scripts connect to an existing Cluster. See the [configuration and migration guide](../../docs/guide/redis-cluster.md) for component settings, consistency limits, and rollout checks.
 
-### Using an external MySQL / PostgreSQL / Redis
+### Using an external MySQL / PostgreSQL / GoldenDB / Redis
 
-To point CubeSandbox at an existing MySQL, PostgreSQL, or Redis server instead
-of the bundled local containers, set the following in `.env` before running
-`install.sh` (see `env.example`). `CUBE_DATABASE_DRIVER` mirrors Helm
-`database.driver`: `mysql` (default) or `postgres` (always external).
+To point CubeSandbox at an existing MySQL, PostgreSQL, GoldenDB, or Redis
+server instead of the bundled local containers, set the following in `.env`
+before running `install.sh` (see `env.example`). `CUBE_DATABASE_DRIVER` mirrors
+Helm `database.driver`: `mysql` (default), `postgres` (always external), or
+`goldendb` (always external).
 
 ```bash
 # External MySQL (default driver; any subset of the credential fields may be overridden)
@@ -447,6 +448,18 @@ CUBE_EXTERNAL_MYSQL_DB=cube_mvp
 # CUBE_EXTERNAL_POSTGRES_PASSWORD=cube_pass
 # CUBE_EXTERNAL_POSTGRES_DB=cube_mvp
 
+# External GoldenDB (one-click never ships a local GoldenDB). ADDRS is a
+# comma-separated CN list; every CN needs its port. MODE is one of single,
+# random, masterslave (default; keeps schema migration on the master CN) or
+# master_cn. PROXY_GROUPS is ';'-separated priority groups.
+# CUBE_DATABASE_DRIVER=goldendb
+# CUBE_EXTERNAL_GOLDENDB_ADDRS=10.0.0.30:3306,10.0.0.31:3306
+# CUBE_EXTERNAL_GOLDENDB_USER=cube
+# CUBE_EXTERNAL_GOLDENDB_PASSWORD=cube_pass
+# CUBE_EXTERNAL_GOLDENDB_DB=cube_mvp
+# CUBE_EXTERNAL_GOLDENDB_MODE=masterslave
+# CUBE_EXTERNAL_GOLDENDB_PROXY_GROUPS=10.0.1.1:3306,10.0.1.2:3306;10.1.0.1:3306
+
 # External Redis
 CUBE_EXTERNAL_REDIS_HOST=10.0.0.21
 CUBE_EXTERNAL_REDIS_PORT=6379
@@ -454,13 +467,16 @@ CUBE_EXTERNAL_REDIS_PASSWORD=ceuhvu123
 ```
 
 When `CUBE_EXTERNAL_MYSQL_HOST`, `CUBE_EXTERNAL_POSTGRES_HOST` (with
-`CUBE_DATABASE_DRIVER=postgres`), and/or `CUBE_EXTERNAL_REDIS_HOST` is set,
-`install.sh`:
+`CUBE_DATABASE_DRIVER=postgres`), `CUBE_EXTERNAL_GOLDENDB_ADDRS`, and/or
+`CUBE_EXTERNAL_REDIS_HOST` is set, `install.sh`:
 
-- patches `instance_db_config` (`driver`, address, user, password, database) in
-  both `CubeMaster/conf.yaml` and `CubeTemplateCenter/conf.yaml`;
+- patches `instance_db_config` (`driver`, address, user, password, database, plus
+  the `goldendb:` sub-block for `goldendb`) in both `CubeMaster/conf.yaml` and
+  `CubeTemplateCenter/conf.yaml`;
 - writes `DATABASE_URL` (`mysql://` or `postgresql://`) and `CUBE_PROXY_REDIS_*`
-  to `.one-click.env` so every service consumes the external endpoint;
+  to `.one-click.env` so every service consumes the external endpoint. For
+  `goldendb`, it writes `CUBE_EXTERNAL_GOLDENDB_*` instead and removes
+  `DATABASE_URL`, because a multi-CN list has no single-host URL form;
 - masks the corresponding `cube-sandbox-mysql.service` / `cube-sandbox-redis.service`
   so the local container is never started; and
 - makes `quickcheck.sh` and `up-support.sh` skip lifecycle management of the

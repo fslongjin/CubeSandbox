@@ -16,6 +16,7 @@ require (
 	github.com/tencentcloud/CubeSandbox/pkgs/CubeLog v0.1.1-0.20260113105508-a996703fa42f
 	github.com/tencentcloud/CubeSandbox/pkgs/blobstore v0.0.0
 	github.com/tencentcloud/CubeSandbox/pkgs/cubedb v0.1.0
+	github.com/tencentcloud/CubeSandbox/pkgs/third_party/goldendb-go-sql-driver v0.0.0-00010101000000-000000000000 // indirect
 	github.com/urfave/cli v1.22.15
 	golang.org/x/crypto v0.55.0
 	gorm.io/gorm v1.25.10
@@ -126,3 +127,5 @@ require (
 replace github.com/tencentcloud/CubeSandbox/pkgs/cubedb => ../pkgs/cubedb
 
 replace github.com/tencentcloud/CubeSandbox/pkgs/redisx => ../pkgs/redisx
+
+replace github.com/tencentcloud/CubeSandbox/pkgs/third_party/goldendb-go-sql-driver => ../pkgs/third_party/goldendb-go-sql-driver

@@ -64,8 +64,23 @@ fi
 #   CUBE_OPS_WAREHOUSE_GITHUB_REPOS / CUBE_OPS_WAREHOUSE_CNB_REPOS
 #   CUBE_OPS_WAREHOUSE_GITHUB_TOKEN / CUBE_OPS_WAREHOUSE_CNB_TOKEN
 
-# Shared MySQL (same instance as CubeMaster, database cube_mvp).
-if [[ -n "${DATABASE_URL:-}" ]]; then
+# Shared SQL database (same instance as CubeMaster, database cube_mvp).
+# GoldenDB wins when configured: its CN list has no URL form, so CubeOps reads
+# the CUBE_GOLDENDB_* fields instead of DATABASE_URL.
+if [[ -n "${CUBE_EXTERNAL_GOLDENDB_ADDRS:-}" ]]; then
+  export CUBE_GOLDENDB_ADDRS="${CUBE_EXTERNAL_GOLDENDB_ADDRS}"
+  export CUBE_GOLDENDB_USER="${CUBE_EXTERNAL_GOLDENDB_USER:-cube}"
+  export CUBE_GOLDENDB_PASSWORD="${CUBE_EXTERNAL_GOLDENDB_PASSWORD:-}"
+  export CUBE_GOLDENDB_DB="${CUBE_EXTERNAL_GOLDENDB_DB:-cube_mvp}"
+  export CUBE_GOLDENDB_MODE="${CUBE_EXTERNAL_GOLDENDB_MODE:-masterslave}"
+  if [[ -n "${CUBE_EXTERNAL_GOLDENDB_PROXY_GROUPS:-}" ]]; then
+    export CUBE_GOLDENDB_PROXY_GROUPS="${CUBE_EXTERNAL_GOLDENDB_PROXY_GROUPS}"
+  fi
+  if [[ -n "${CUBE_EXTERNAL_GOLDENDB_MIN_CONNECTION_PROXYS:-}" ]]; then
+    export CUBE_GOLDENDB_MIN_CONNECTION_PROXYS="${CUBE_EXTERNAL_GOLDENDB_MIN_CONNECTION_PROXYS}"
+  fi
+  unset DATABASE_URL
+elif [[ -n "${DATABASE_URL:-}" ]]; then
   export DATABASE_URL
 else
   # No URL: hand CubeOps the split fields. It maps them straight onto its

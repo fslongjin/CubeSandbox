@@ -33,6 +33,7 @@ import (
 
 	"github.com/goccy/go-yaml"
 	"github.com/tencentcloud/CubeSandbox/pkgs/cubedb/dao"
+	"github.com/tencentcloud/CubeSandbox/pkgs/cubedb/dao/driver/goldendb"
 )
 
 // Config holds all CubeOps runtime configuration.
@@ -52,6 +53,12 @@ type Config struct {
 	MySQLUser     string `yaml:"mysql_user"`
 	MySQLPassword string `yaml:"mysql_password"`
 	MySQLDB       string `yaml:"mysql_db"`
+
+	// GoldenDB is the GoldenDB endpoint. A non-empty Addrs list selects the
+	// goldendb driver and takes precedence over DATABASE_URL and the MySQL*
+	// fields, because a multi-CN address list cannot be expressed as a
+	// single-host URL.
+	GoldenDB GoldenDBConfig `yaml:"goldendb"`
 
 	// JWT
 	AccessTTL  time.Duration `yaml:"access_ttl"`
@@ -118,6 +125,35 @@ const (
 	StoreBackendFS = "fs"
 	DefaultFSRoot  = "/var/lib/cubeops/blobs"
 )
+
+// GoldenDBConfig mirrors the instance_db_config.goldendb block in the
+// CubeMaster config, so one values file can describe both processes.
+type GoldenDBConfig struct {
+	// Addrs is the comma-separated CN list, e.g.
+	// "10.0.0.1:3306,10.0.0.2:3306". Empty means "not a GoldenDB deployment".
+	Addrs string `yaml:"addrs"`
+	User  string `yaml:"user"`
+	// Password is separate from MySQLPassword so the two engines cannot leak
+	// credentials into each other's connection path.
+	Password string `yaml:"password"`
+	DB       string `yaml:"db"`
+	// Mode is single, random, masterslave or master_cn; empty means
+	// masterslave.
+	Mode string `yaml:"mode"`
+	// BlackListMS / MasterBlackListMS: nil leaves the driver default.
+	BlackListMS       *int64 `yaml:"blacklist_ms"`
+	MasterBlackListMS *int64 `yaml:"master_blacklist_ms"`
+	// ProxyGroups lists priority groups, highest priority first, each a
+	// comma-separated list of host:port members.
+	ProxyGroups         []string `yaml:"proxy_groups"`
+	MinConnectionProxys int      `yaml:"min_connection_proxys"`
+	ColumnsNameToLower  *bool    `yaml:"columns_name_to_lower"`
+}
+
+// Configured reports whether a GoldenDB endpoint was supplied.
+func (g GoldenDBConfig) Configured() bool {
+	return strings.TrimSpace(g.Addrs) != ""
+}
 
 // SoftDeletePurgeConf configures the CubeOps tombstone purger.
 type SoftDeletePurgeConf struct {
@@ -252,23 +288,64 @@ func Load() (*Config, error) {
 	return cfg, nil
 }
 
-// DaoConfig maps the config to a CubeDB dao.Config. DatabaseURL wins when
-// set (driver inferred from its scheme); otherwise the MySQL* fields are used
-// directly, so passwords never round-trip through a URL.
+// DaoConfig maps the config to a CubeDB dao.Config. A configured GoldenDB
+// endpoint wins when set, because its multi-CN address list has no single-host
+// URL equivalent. Otherwise DatabaseURL wins (driver inferred from its
+// scheme); otherwise the MySQL* fields are used directly, so passwords never
+// round-trip through a URL.
 func (c *Config) DaoConfig() (dao.Config, error) {
+	if c.GoldenDB.Configured() {
+		return c.daoConfigFromGoldenDB()
+	}
 	// Both DATABASE_URL and the split MySQL* fields are empty: point the
 	// operator at both knobs instead of a misleading per-field error.
 	if strings.TrimSpace(c.DatabaseURL) == "" &&
 		strings.TrimSpace(c.MySQLHost) == "" &&
 		strings.TrimSpace(c.MySQLUser) == "" &&
 		strings.TrimSpace(c.MySQLDB) == "" {
-		return dao.Config{}, fmt.Errorf("no database configured: set DATABASE_URL, or CUBE_SANDBOX_MYSQL_{HOST,USER,DB} (PASSWORD optional) via env or the YAML at %s", yamlConfigPath())
+		return dao.Config{}, fmt.Errorf("no database configured: set DATABASE_URL, or CUBE_SANDBOX_MYSQL_{HOST,USER,DB} (PASSWORD optional), or CUBE_GOLDENDB_ADDRS via env or the YAML at %s", yamlConfigPath())
 	}
 	if strings.TrimSpace(c.DatabaseURL) == "" {
 		// Whitespace-only URL counts as unset: fall back to the split-field path.
 		return c.daoConfigFromFields()
 	}
 	return c.daoConfigFromURL()
+}
+
+// daoConfigFromGoldenDB builds the goldendb dao.Config. Addrs is the
+// comma-separated CN list; the driver splits it and appends the GoldenDB
+// parameters, so the address must not be wrapped as a single host:port here.
+func (c *Config) daoConfigFromGoldenDB() (dao.Config, error) {
+	addrs := strings.TrimSpace(c.GoldenDB.Addrs)
+	for _, addr := range strings.Split(addrs, ",") {
+		addr = strings.TrimSpace(addr)
+		if addr == "" {
+			return dao.Config{}, fmt.Errorf("goldendb.addrs %q contains an empty address", addrs)
+		}
+	}
+	user := strings.TrimSpace(c.GoldenDB.User)
+	if user == "" {
+		return dao.Config{}, fmt.Errorf("goldendb.user is required (set CUBE_GOLDENDB_USER or goldendb.user)")
+	}
+	dbname := strings.TrimSpace(c.GoldenDB.DB)
+	if dbname == "" {
+		return dao.Config{}, fmt.Errorf("goldendb.db is required (set CUBE_GOLDENDB_DB or goldendb.db)")
+	}
+	return newDAOConfig(goldendb.DriverName, user, c.GoldenDB.Password,
+		addrs, dbname, c.goldenDBExtra()), nil
+}
+
+// goldenDBExtra renders the GoldenDB-only options as the driver's Extra keys.
+func (c *Config) goldenDBExtra() map[string]string {
+	g := c.GoldenDB
+	return goldendb.Settings{
+		Mode:                g.Mode,
+		BlackListMS:         g.BlackListMS,
+		MasterBlackListMS:   g.MasterBlackListMS,
+		ProxyGroups:         g.ProxyGroups,
+		MinConnectionProxys: g.MinConnectionProxys,
+		ColumnsNameToLower:  g.ColumnsNameToLower,
+	}.Extra()
 }
 
 // daoConfigFromFields builds a dao.Config directly from the MySQL* fields,
@@ -499,6 +576,45 @@ func overrideFromEnv(cfg *Config) {
 	if v := os.Getenv("CUBE_SANDBOX_MYSQL_DB"); v != "" {
 		cfg.MySQLDB = v
 	}
+	if v := os.Getenv("CUBE_GOLDENDB_ADDRS"); v != "" {
+		cfg.GoldenDB.Addrs = v
+	}
+	if v := os.Getenv("CUBE_GOLDENDB_USER"); v != "" {
+		cfg.GoldenDB.User = v
+	}
+	if v := os.Getenv("CUBE_GOLDENDB_PASSWORD"); v != "" {
+		cfg.GoldenDB.Password = v
+	}
+	if v := os.Getenv("CUBE_GOLDENDB_DB"); v != "" {
+		cfg.GoldenDB.DB = v
+	}
+	if v := os.Getenv("CUBE_GOLDENDB_MODE"); v != "" {
+		cfg.GoldenDB.Mode = v
+	}
+	if v := os.Getenv("CUBE_GOLDENDB_BLACKLIST_MS"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			cfg.GoldenDB.BlackListMS = &n
+		}
+	}
+	if v := os.Getenv("CUBE_GOLDENDB_MASTER_BLACKLIST_MS"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			cfg.GoldenDB.MasterBlackListMS = &n
+		}
+	}
+	if v := os.Getenv("CUBE_GOLDENDB_PROXY_GROUPS"); v != "" {
+		// Groups are separated by ';' because members use ','.
+		cfg.GoldenDB.ProxyGroups = splitProxyGroups(v)
+	}
+	if v := os.Getenv("CUBE_GOLDENDB_MIN_CONNECTION_PROXYS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.GoldenDB.MinConnectionProxys = n
+		}
+	}
+	if v := os.Getenv("CUBE_GOLDENDB_COLUMNS_NAME_TO_LOWER"); v != "" {
+		if p := parseEnvBool(v); p != nil {
+			cfg.GoldenDB.ColumnsNameToLower = p
+		}
+	}
 	if v := os.Getenv("CUBE_MASTER_ADDR"); v != "" {
 		cfg.CubeMasterAddr = v
 	}
@@ -703,6 +819,19 @@ func splitCSV(v string) []string {
 	for _, p := range parts {
 		p = strings.TrimSpace(p)
 		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// splitProxyGroups splits "g1a,g1b;g2a" into groups. Members stay comma
+// separated, which is what GoldenDB's proxygroupN parameter expects.
+func splitProxyGroups(v string) []string {
+	parts := strings.Split(v, ";")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
 			out = append(out, p)
 		}
 	}

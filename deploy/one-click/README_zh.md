@@ -338,12 +338,13 @@ MySQL/Redis 依赖默认会部署到：
 
 将 `CUBE_EXTERNAL_REDIS_CLUSTER_NODES` 设置为以逗号分隔的 `host:port` 种子节点列表，将 `CUBE_EXTERNAL_REDIS_DB` 设置为 `0`，并清空固定的单机 Redis 地址和 Sentinel 配置。部署脚本连接已有的 Cluster，不负责创建 Redis 集群。各组件配置、一致性限制和迁移检查见 [配置与迁移指南](../../docs/zh/guide/redis-cluster.md)。
 
-### 使用外部 MySQL / PostgreSQL / Redis
+### 使用外部 MySQL / PostgreSQL / GoldenDB / Redis
 
-如果希望使用已有的 MySQL、PostgreSQL 或 Redis 服务器，而不是内置的本地容器，
+如果希望使用已有的 MySQL、PostgreSQL、GoldenDB 或 Redis 服务器，而不是内置的本地容器，
 可在执行 `install.sh` 之前在 `.env` 中设置以下变量（参见 `env.example`）。
-`CUBE_DATABASE_DRIVER` 对齐 Helm 的 `database.driver`：`mysql`（默认）或
-`postgres`（始终外置，one-click 从不自带本地 PostgreSQL）。
+`CUBE_DATABASE_DRIVER` 对齐 Helm 的 `database.driver`：`mysql`（默认）、
+`postgres`（始终外置，one-click 从不自带本地 PostgreSQL）或 `goldendb`
+（始终外置，one-click 从不自带本地 GoldenDB）。
 
 ```bash
 # 外部 MySQL（默认驱动；凭据字段可按需覆盖）
@@ -362,6 +363,17 @@ CUBE_EXTERNAL_MYSQL_DB=cube_mvp
 # CUBE_EXTERNAL_POSTGRES_PASSWORD=cube_pass
 # CUBE_EXTERNAL_POSTGRES_DB=cube_mvp
 
+# 外部 GoldenDB。ADDRS 为逗号分隔的 CN 列表，每个 CN 都必须带端口。
+# MODE 可选 single、random、masterslave（默认，迁移会落在主 CN）或 master_cn。
+# PROXY_GROUPS 为以 ';' 分隔的优先级分组，组内成员用逗号分隔。
+# CUBE_DATABASE_DRIVER=goldendb
+# CUBE_EXTERNAL_GOLDENDB_ADDRS=10.0.0.30:3306,10.0.0.31:3306
+# CUBE_EXTERNAL_GOLDENDB_USER=cube
+# CUBE_EXTERNAL_GOLDENDB_PASSWORD=cube_pass
+# CUBE_EXTERNAL_GOLDENDB_DB=cube_mvp
+# CUBE_EXTERNAL_GOLDENDB_MODE=masterslave
+# CUBE_EXTERNAL_GOLDENDB_PROXY_GROUPS=10.0.1.1:3306,10.0.1.2:3306;10.1.0.1:3306
+
 # 外部 Redis
 CUBE_EXTERNAL_REDIS_HOST=10.0.0.21
 CUBE_EXTERNAL_REDIS_PORT=6379
@@ -369,10 +381,11 @@ CUBE_EXTERNAL_REDIS_PASSWORD=ceuhvu123
 ```
 
 当设置了 `CUBE_EXTERNAL_MYSQL_HOST`、`CUBE_EXTERNAL_POSTGRES_HOST`（且
-`CUBE_DATABASE_DRIVER=postgres`）和/或 `CUBE_EXTERNAL_REDIS_HOST` 时，`install.sh` 会：
+`CUBE_DATABASE_DRIVER=postgres`）、`CUBE_EXTERNAL_GOLDENDB_ADDRS` 和/或
+`CUBE_EXTERNAL_REDIS_HOST` 时，`install.sh` 会：
 
-- 用外部地址改写 `CubeMaster/conf.yaml` 和 `CubeTemplateCenter/conf.yaml` 的 `instance_db_config`（驱动、地址、用户、密码、库名）；
-- 将 `DATABASE_URL`（`mysql://` 或 `postgresql://`）和 `CUBE_PROXY_REDIS_*` 写入 `.one-click.env`，让各服务都连接外部地址；
+- 用外部地址改写 `CubeMaster/conf.yaml` 和 `CubeTemplateCenter/conf.yaml` 的 `instance_db_config`（驱动、地址、用户、密码、库名；GoldenDB 还会写入 `goldendb:` 子块）；
+- 将 `DATABASE_URL`（`mysql://` 或 `postgresql://`）和 `CUBE_PROXY_REDIS_*` 写入 `.one-click.env`，让各服务都连接外部地址。`goldendb` 改为写入 `CUBE_EXTERNAL_GOLDENDB_*` 并删除 `DATABASE_URL`，因为多 CN 地址列表无法表达成单地址 URL；
 - mask 对应的 `cube-sandbox-mysql.service` / `cube-sandbox-redis.service`，本地容器不会再被启动；
 - 让 `quickcheck.sh` 和 `up-support.sh` 跳过对已外置依赖的本地生命周期管理（`down-support.sh` 未感知外部依赖，仍会执行 `docker compose down`，但由于本地容器从未被启动，这是无害的空操作）。
 

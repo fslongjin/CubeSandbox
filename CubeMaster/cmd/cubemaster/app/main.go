@@ -38,6 +38,7 @@ import (
 	_ "github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/volume/plugin/rpc"
 	"github.com/tencentcloud/CubeSandbox/pkgs/CubeLog"
 	"github.com/tencentcloud/CubeSandbox/pkgs/cubedb/dao"
+	_ "github.com/tencentcloud/CubeSandbox/pkgs/cubedb/dao/driver/goldendb" // register goldendb driver
 	_ "github.com/tencentcloud/CubeSandbox/pkgs/cubedb/dao/driver/mysql"    // register mysql driver
 	_ "github.com/tencentcloud/CubeSandbox/pkgs/cubedb/dao/driver/postgres" // register postgres driver
 	"github.com/tencentcloud/CubeSandbox/pkgs/cubedb/migrate"

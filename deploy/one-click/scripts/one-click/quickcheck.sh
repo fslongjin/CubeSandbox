@@ -335,14 +335,16 @@ quickcheck_main() {
     OPS_ADDR="$(resolve_control_plane_cubeops_addr)"
   fi
 
-  # When external MySQL/PostgreSQL/Redis is configured the local container +
-  # systemd unit do not exist, so the corresponding checks must be skipped.
+  # When external MySQL/PostgreSQL/GoldenDB/Redis is configured the local
+  # container + systemd unit do not exist, so the corresponding checks must be
+  # skipped.
   local EXTERNAL_MYSQL_HOST="${CUBE_EXTERNAL_MYSQL_HOST:-}"
   local EXTERNAL_POSTGRES_HOST="${CUBE_EXTERNAL_POSTGRES_HOST:-}"
+  local EXTERNAL_GOLDENDB_ADDRS="${CUBE_EXTERNAL_GOLDENDB_ADDRS:-}"
   local EXTERNAL_REDIS_HOST="${CUBE_EXTERNAL_REDIS_HOST:-}"
   local EXTERNAL_REDIS_MASTER_NAME="${CUBE_EXTERNAL_REDIS_MASTER_NAME:-}"
   local SKIP_LOCAL_MYSQL=0
-  if [[ -n "${EXTERNAL_MYSQL_HOST}" || -n "${EXTERNAL_POSTGRES_HOST}" ]]; then
+  if [[ -n "${EXTERNAL_MYSQL_HOST}" || -n "${EXTERNAL_POSTGRES_HOST}" || -n "${EXTERNAL_GOLDENDB_ADDRS}" ]]; then
     SKIP_LOCAL_MYSQL=1
   fi
 

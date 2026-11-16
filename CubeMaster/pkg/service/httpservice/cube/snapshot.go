@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/go-sql-driver/mysql"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/log"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/errorcode"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/localcache"
@@ -24,6 +23,7 @@ import (
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/service/sandbox/types"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/templatecenter"
 	CubeLog "github.com/tencentcloud/CubeSandbox/pkgs/CubeLog"
+	"github.com/tencentcloud/CubeSandbox/pkgs/cubedb/dberr"
 	"github.com/tencentcloud/CubeSandbox/pkgs/snapshotmode"
 )
 
@@ -798,12 +798,11 @@ func snapshotErrorCode(err error) int {
 }
 
 func isMySQLLockError(err error) bool {
-	var mysqlErr *mysql.MySQLError
-	if errors.As(err, &mysqlErr) {
-		switch mysqlErr.Number {
-		case 1205, 1213:
-			return true
-		}
+	// Structured match covers both linked MySQL drivers (upstream "mysql" and
+	// the vendored "goldendb"). The string checks below stay as a backstop for
+	// errors that arrive as text, e.g. replayed from a job's error_message.
+	if dberr.IsLockConflict(err) {
+		return true
 	}
 	message := err.Error()
 	return strings.Contains(message, "Error 1213") ||

@@ -968,13 +968,14 @@ already include one, the in-cluster FQDN does not.
 database.driver selects which connection section the control plane reads:
   mysql    -> mysql.*    (built-in StatefulSet when mysql.host is empty)
   postgres -> postgres.* (external only; the chart never deploys PostgreSQL)
+  goldendb -> goldendb.* (external only; a GoldenDB cluster is never deployed)
 Each engine keeps its own host/port/database/user/password, so no key is
 shared between engines and no value is inferred across sections.
 */}}
 {{- define "cube.dbDriver" -}}
 {{- $driver := ((.Values.database).driver) | default "mysql" -}}
-{{- if not (has $driver (list "mysql" "postgres")) -}}
-{{- fail (printf "database.driver must be mysql or postgres (got %q)" $driver) -}}
+{{- if not (has $driver (list "mysql" "postgres" "goldendb")) -}}
+{{- fail (printf "database.driver must be mysql, postgres or goldendb (got %q)" $driver) -}}
 {{- end -}}
 {{- $driver -}}
 {{- end -}}
@@ -982,6 +983,8 @@ shared between engines and no value is inferred across sections.
 {{- define "cube.dbHostRaw" -}}
 {{- if eq (include "cube.dbDriver" .) "postgres" -}}
 {{- ((.Values.postgres).host) | default "" -}}
+{{- else if eq (include "cube.dbDriver" .) "goldendb" -}}
+{{- ((.Values.goldendb).addrs) | default "" -}}
 {{- else -}}
 {{- ((.Values.mysql).host) | default "" -}}
 {{- end -}}
@@ -989,7 +992,10 @@ shared between engines and no value is inferred across sections.
 
 {{- define "cube.dbHost" -}}
 {{- $host := include "cube.dbHostRaw" . -}}
-{{- if $host -}}{{ $host }}{{- else -}}{{ include "cube.mysqlName" . }}.{{ .Release.Namespace }}.svc.{{ include "cube.clusterDomain" . }}{{- end -}}
+{{- if eq (include "cube.dbDriver" .) "goldendb" -}}
+{{- /* GoldenDB: the raw value is a comma-separated CN list, never host:port. */ -}}
+{{- $host -}}
+{{- else if $host -}}{{ $host }}{{- else -}}{{ include "cube.mysqlName" . }}.{{ .Release.Namespace }}.svc.{{ include "cube.clusterDomain" . }}{{- end -}}
 {{- end -}}
 
 {{/* Deprecated alias of cube.dbHost (kept so older includes keep working). */}}
@@ -1000,6 +1006,9 @@ shared between engines and no value is inferred across sections.
 {{- define "cube.dbPort" -}}
 {{- if eq (include "cube.dbDriver" .) "postgres" -}}
 {{- ((.Values.postgres).port) | default 5432 -}}
+{{- else if eq (include "cube.dbDriver" .) "goldendb" -}}
+{{- /* Every CN in goldendb.addrs carries its own port. */ -}}
+{{- "" -}}
 {{- else -}}
 {{- ((.Values.mysql).port) | default 3306 -}}
 {{- end -}}
@@ -1008,6 +1017,8 @@ shared between engines and no value is inferred across sections.
 {{- define "cube.dbUser" -}}
 {{- if eq (include "cube.dbDriver" .) "postgres" -}}
 {{- ((.Values.postgres).user) | default "cube" -}}
+{{- else if eq (include "cube.dbDriver" .) "goldendb" -}}
+{{- ((.Values.goldendb).user) | default "cube" -}}
 {{- else -}}
 {{- ((.Values.mysql).user) | default "cube" -}}
 {{- end -}}
@@ -1016,6 +1027,8 @@ shared between engines and no value is inferred across sections.
 {{- define "cube.dbName" -}}
 {{- if eq (include "cube.dbDriver" .) "postgres" -}}
 {{- ((.Values.postgres).database) | default "cube_mvp" -}}
+{{- else if eq (include "cube.dbDriver" .) "goldendb" -}}
+{{- ((.Values.goldendb).database) | default "cube_mvp" -}}
 {{- else -}}
 {{- ((.Values.mysql).database) | default "cube_mvp" -}}
 {{- end -}}
@@ -1024,6 +1037,8 @@ shared between engines and no value is inferred across sections.
 {{- define "cube.dbPassword" -}}
 {{- if eq (include "cube.dbDriver" .) "postgres" -}}
 {{- ((.Values.postgres).password) | default "" -}}
+{{- else if eq (include "cube.dbDriver" .) "goldendb" -}}
+{{- ((.Values.goldendb).password) | default "" -}}
 {{- else -}}
 {{- ((.Values.mysql).password) | default "" -}}
 {{- end -}}
@@ -1037,6 +1052,8 @@ shared between engines and no value is inferred across sections.
 {{/*
 CubeOps / CubeAPI DATABASE_URL. postgres must use a URL scheme;
 CUBE_SANDBOX_MYSQL_* alone is always assembled as mysql://.
+GoldenDB never renders a URL: a comma-separated CN list has no single-host URL
+form, so those processes take CUBE_GOLDENDB_* instead.
 */}}
 {{- define "cube.databaseURL" -}}
 {{- $driver := include "cube.dbDriver" . -}}
@@ -1047,14 +1064,30 @@ CUBE_SANDBOX_MYSQL_* alone is always assembled as mysql://.
 {{- $name := include "cube.dbName" . | urlquery -}}
 {{- if eq $driver "postgres" -}}
 {{- printf "postgresql://%s:%s@%s:%v/%s" $user $pass $host $port $name -}}
+{{- else if eq $driver "goldendb" -}}
+{{- /* Not reachable: templates emit CUBE_GOLDENDB_* for this driver. */ -}}
+{{- fail "database.driver=goldendb has no URL form; use the CUBE_GOLDENDB_* environment instead" -}}
 {{- else -}}
 {{- printf "mysql://%s:%s@%s:%v/%s" $user $pass $host $port $name -}}
 {{- end -}}
 {{- end -}}
 
 {{- define "cube.mysqlBuiltinEnabled" -}}
-{{- /* Built-in StatefulSet is MySQL only; postgres is always external. */ -}}
-{{- if and .Values.controlPlane.enabled .Values.mysql.enabled (eq (((.Values.mysql).host) | default "") "") (ne (include "cube.dbDriver" .) "postgres") -}}true{{- else -}}false{{- end -}}
+{{- /* Built-in StatefulSet is MySQL only; postgres and goldendb are always external. */ -}}
+{{- if and .Values.controlPlane.enabled .Values.mysql.enabled (eq (((.Values.mysql).host) | default "") "") (eq (include "cube.dbDriver" .) "mysql") -}}true{{- else -}}false{{- end -}}
+{{- end -}}
+
+{{- /*
+GoldenDB driver mode. Empty means masterslave, which keeps schema migration on
+the master CN; the driver documents single/random/masterslave/master_cn.
+*/}}
+{{- define "cube.goldendbMode" -}}
+{{- ((.Values.goldendb).mode) | default "masterslave" -}}
+{{- end -}}
+
+{{/* Priority groups are a yaml list; the driver reads one ';'-joined string. */}}
+{{- define "cube.goldendbProxyGroups" -}}
+{{- join ";" (((.Values.goldendb).proxyGroups) | default (list)) -}}
 {{- end -}}
 
 {{- define "cube.redisHost" -}}

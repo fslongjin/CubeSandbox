@@ -27,3 +27,6 @@
 !pkgs/sandboxrestart/**
 !pkgs/redisx
 !pkgs/redisx/**
+!pkgs/third_party
+!pkgs/third_party/goldendb-go-sql-driver
+!pkgs/third_party/goldendb-go-sql-driver/**

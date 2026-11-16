@@ -222,6 +222,12 @@ away from CubeMaster means one of the two Pods cannot attach the volume.
 {{- if and (eq (include "cube.dbDriver" .) "postgres") (eq (include "cube.dbHostRaw" .) "") }}
 {{- fail "database.driver=postgres requires postgres.host (the chart-managed MySQL StatefulSet cannot serve PostgreSQL)" }}
 {{- end }}
+{{- if and (eq (include "cube.dbDriver" .) "goldendb") (eq (include "cube.dbHostRaw" .) "") }}
+{{- fail "database.driver=goldendb requires goldendb.addrs (a comma-separated CN list; the chart never deploys GoldenDB)" }}
+{{- end }}
+{{- if and (eq (include "cube.dbDriver" .) "goldendb") (not (has (include "cube.goldendbMode" .) (list "single" "random" "masterslave" "master_cn"))) }}
+{{- fail (printf "goldendb.mode must be single, random, masterslave or master_cn (got %q)" (include "cube.goldendbMode" .)) }}
+{{- end }}
 {{- if and $controlPlaneNeedsMysql (not (eq (include "cube.mysqlBuiltinEnabled" .) "true")) (eq (include "cube.dbHostRaw" .) "") }}
 {{- fail "control plane requires mysql.host when mysql.enabled=false" }}
 {{- end }}

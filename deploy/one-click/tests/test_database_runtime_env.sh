@@ -36,6 +36,22 @@ assert_contains() {
   grep -Fq -- "$2" "$1" || fail "expected $1 to contain: $2"
 }
 
+# assert_sourced_value loads the env file the way runtime helpers do (set -a;
+# source) and compares the resulting shell variable. Needed for values that are
+# persisted quoted because they contain shell metacharacters (e.g. ';').
+assert_sourced_value() {
+  local file="$1" key="$2" expected="$3"
+  local actual
+  actual="$(
+    set -a
+    # shellcheck disable=SC1090
+    source "${file}"
+    set +a
+    printf '%s' "${!key-}"
+  )"
+  [[ "${actual}" == "${expected}" ]] || fail "expected ${key}='${expected}' after sourcing, got '${actual}'"
+}
+
 assert_not_contains() {
   if grep -Fq -- "$2" "$1"; then
     fail "expected $1 NOT to contain: $2"
@@ -53,6 +69,10 @@ persist_db_clean() {
       CUBE_EXTERNAL_MYSQL_PASSWORD CUBE_EXTERNAL_MYSQL_DB \
       CUBE_EXTERNAL_POSTGRES_HOST CUBE_EXTERNAL_POSTGRES_PORT CUBE_EXTERNAL_POSTGRES_USER \
       CUBE_EXTERNAL_POSTGRES_PASSWORD CUBE_EXTERNAL_POSTGRES_DB \
+      CUBE_EXTERNAL_GOLDENDB_ADDRS CUBE_EXTERNAL_GOLDENDB_USER \
+      CUBE_EXTERNAL_GOLDENDB_PASSWORD CUBE_EXTERNAL_GOLDENDB_DB \
+      CUBE_EXTERNAL_GOLDENDB_MODE CUBE_EXTERNAL_GOLDENDB_PROXY_GROUPS \
+      CUBE_EXTERNAL_GOLDENDB_MIN_CONNECTION_PROXYS \
       CUBE_SANDBOX_MYSQL_HOST CUBE_SANDBOX_MYSQL_PORT CUBE_SANDBOX_MYSQL_USER \
       CUBE_SANDBOX_MYSQL_PASSWORD CUBE_SANDBOX_MYSQL_DB
     # shellcheck disable=SC1091
@@ -104,8 +124,55 @@ test_persist_encodes_local_mysql_password() {
     'mysql://cube:p%23a%3Fb%2Fc@127.0.0.1:3306/cube_mvp'
 }
 
+# GoldenDB persists its CN list as dedicated keys and drops DATABASE_URL: a
+# multi-CN address cannot be expressed as a single-host URL, and leaving a stale
+# URL behind would point CubeOps back at one CN.
+test_persist_goldendb_drops_database_url() {
+  local env_file="${TMP_DIR}/goldendb.env"
+  printf 'DATABASE_URL=mysql://stale:stale@127.0.0.1:3306/cube_mvp\n' > "${env_file}"
+
+  persist_db_clean "${env_file}" \
+    CUBE_DATABASE_DRIVER=goldendb \
+    CUBE_EXTERNAL_GOLDENDB_ADDRS='10.0.0.11:3306,10.0.0.12:3306' \
+    CUBE_EXTERNAL_GOLDENDB_PASSWORD='p#a?b/c' \
+    CUBE_EXTERNAL_GOLDENDB_PROXY_GROUPS='10.0.1.1:3306,10.0.1.2:3306;10.1.0.1:3306'
+
+  assert_value "${env_file}" CUBE_DATABASE_DRIVER goldendb
+  assert_value "${env_file}" CUBE_EXTERNAL_GOLDENDB_ADDRS '10.0.0.11:3306,10.0.0.12:3306'
+  assert_value "${env_file}" CUBE_EXTERNAL_GOLDENDB_USER cube
+  assert_value "${env_file}" CUBE_EXTERNAL_GOLDENDB_DB cube_mvp
+  assert_value "${env_file}" CUBE_EXTERNAL_GOLDENDB_MODE masterslave
+  assert_sourced_value "${env_file}" CUBE_EXTERNAL_GOLDENDB_PROXY_GROUPS \
+    '10.0.1.1:3306,10.0.1.2:3306;10.1.0.1:3306'
+  assert_not_contains "${env_file}" 'DATABASE_URL='
+}
+
+# Switching from GoldenDB to MySQL must scrub the GoldenDB markers so a stale
+# addrs list cannot keep pointing deployments at the old engine.
+test_persist_mysql_clears_goldendb() {
+  local env_file="${TMP_DIR}/goldendb-to-mysql.env"
+  cat > "${env_file}" <<'EOF'
+CUBE_DATABASE_DRIVER=goldendb
+CUBE_EXTERNAL_GOLDENDB_ADDRS=10.0.0.11:3306
+CUBE_EXTERNAL_GOLDENDB_USER=cube
+CUBE_EXTERNAL_GOLDENDB_PASSWORD=secret
+CUBE_EXTERNAL_GOLDENDB_DB=cube_mvp
+EOF
+
+  persist_db_clean "${env_file}" \
+    CUBE_DATABASE_DRIVER=mysql \
+    CUBE_EXTERNAL_MYSQL_HOST=10.0.0.21
+
+  assert_value "${env_file}" CUBE_DATABASE_DRIVER mysql
+  assert_value "${env_file}" CUBE_EXTERNAL_MYSQL_HOST 10.0.0.21
+  assert_not_contains "${env_file}" 'CUBE_EXTERNAL_GOLDENDB_ADDRS='
+  assert_not_contains "${env_file}" 'CUBE_EXTERNAL_GOLDENDB_PASSWORD='
+}
+
 test_start_scripts_export_split_fields
 test_persist_encodes_external_mysql_password
 test_persist_encodes_local_mysql_password
+test_persist_goldendb_drops_database_url
+test_persist_mysql_clears_goldendb
 
 echo "database runtime env tests OK"

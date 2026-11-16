@@ -51,6 +51,12 @@ spec:
                 secretKeyRef:
                   name: {{ include "cube.secretName" . }}
                   key: database-url
+            {{- else if eq (include "cube.dbDriver" .) "goldendb" }}
+            {{- /*
+            CubeAPI is a Rust service that never opens the control-plane
+            database; it only calls CubeMaster. GoldenDB has no single-host
+            URL to hand over, so nothing is injected here.
+            */}}
             {{- else }}
             - name: CUBE_SANDBOX_MYSQL_HOST
               value: {{ include "cube.dbHost" . | quote }}

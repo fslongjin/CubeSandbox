@@ -30,6 +30,7 @@ on:
       - '.github/workflows/build-builder-image.yml'
       - '.github/workflows/unit-test-check.yml'
       - 'Makefile'
+      - 'pkgs/third_party/goldendb-go-sql-driver/**'
   pull_request:
     paths:
       - 'CubeAPI/**'
@@ -58,6 +59,7 @@ on:
       - '.github/workflows/build-builder-image.yml'
       - '.github/workflows/unit-test-check.yml'
       - 'Makefile'
+      - 'pkgs/third_party/goldendb-go-sql-driver/**'
   workflow_dispatch:
     inputs:
       component:
