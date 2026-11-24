@@ -105,10 +105,18 @@ func newProvider(
 	if locker != nil {
 		opts = append(opts, goose.WithSessionLocker(locker))
 	}
+	if dialect == "goldendb" {
+		names, compat, err := goldenDBMigrationOverrides(subFS)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		opts = append(opts, goose.WithExcludeNames(names), goose.WithGoMigrations(compat...))
+	}
 	provider, err := goose.NewProvider(spec.dialect, sqlDB, subFS, opts...)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("migrate: new provider: %w", err)
 	}
+	// Fingerprints use the canonical SQL, including the version executed in Go on GoldenDB.
 	return provider, subFS, spec.store, nil
 }
 
