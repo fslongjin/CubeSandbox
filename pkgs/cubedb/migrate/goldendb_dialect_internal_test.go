@@ -5,17 +5,56 @@
 package migrate
 
 import (
+	"database/sql"
 	"io/fs"
 	"slices"
 	"strings"
 	"testing"
 
+	"github.com/pressly/goose/v3"
 	"github.com/pressly/goose/v3/database"
 )
 
+func TestGoldenDBOverridesOnlyIncompatibleMigrations(t *testing.T) {
+	mysql, mysqlFS, _, err := newProvider("mysql", &sql.DB{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gold, goldFS, _, err := newProvider("goldendb", &sql.DB{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mysqlSources, goldSources := mysql.ListSources(), gold.ListSources()
+	if len(mysqlSources) != len(goldSources) {
+		t.Fatalf("different migration counts: MySQL %d, GoldenDB %d", len(mysqlSources), len(goldSources))
+	}
+	for i, source := range mysqlSources {
+		got := goldSources[i]
+		want := source.Type
+		switch source.Version {
+		case 8, 9, 20260624113500, snapshotActiveVersion, 20260731120000, 20261112035937:
+			want = goose.TypeGo
+		}
+		if got.Version != source.Version || got.Type != want {
+			t.Fatalf("GoldenDB migration %d = version %d type %s, want %d %s", i, got.Version, got.Type, source.Version, want)
+		}
+	}
+	original, err := fs.ReadFile(mysqlFS, snapshotActiveSQL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fingerprintSource, err := fs.ReadFile(goldFS, snapshotActiveSQL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(original) != string(fingerprintSource) {
+		t.Fatal("the canonical fingerprint source differs across dialects")
+	}
+}
+
 // TestGoldenDBReusesTheMySQLMigrationSet pins the dialect alias. GoldenDB
-// speaks the MySQL wire protocol and shares the schema, so it must run the
-// exact same SQL and fingerprint store as MySQL. A copy of the migrations
+// speaks the MySQL wire protocol and shares the schema, so it uses the same
+// canonical SQL files and fingerprint store as MySQL. A copy of the migrations
 // would let the two histories drift, and a missing entry would make
 // dao.Migrate fail with "unknown dialect".
 func TestGoldenDBReusesTheMySQLMigrationSet(t *testing.T) {

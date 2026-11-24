@@ -601,3 +601,81 @@ func sortedKeys(m map[string]bool) []string {
 	sort.Strings(out)
 	return out
 }
+
+// Exercise the GoldenDB compatibility runner against a MySQL-protocol database.
+// A populated schema with this version still pending models the interrupted run.
+func TestGoldenDBSnapshotActiveResumesAfterSchemaCheck(t *testing.T) {
+	env := newMySQL(t)
+	defer env.teardown()
+	db := openDB(t, env.dsn)
+	defer db.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	if _, err := db.ExecContext(ctx, `CREATE TABLE t_cube_snapshot_runtime_active (
+		sandbox_id VARCHAR(128) NOT NULL,
+		binding_type VARCHAR(64) NOT NULL,
+		snapshot_id VARCHAR(128) NOT NULL,
+		node_id VARCHAR(128) NOT NULL DEFAULT '',
+		node_ip VARCHAR(64) NOT NULL DEFAULT '',
+		memory_vol VARCHAR(256) NOT NULL DEFAULT '',
+		rootfs_vol VARCHAR(256) NOT NULL DEFAULT '',
+		sandbox_gen INT UNSIGNED NOT NULL DEFAULT 0,
+		attached_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		last_seen_at DATETIME DEFAULT NULL,
+		last_error TEXT,
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		PRIMARY KEY (sandbox_id, binding_type),
+		KEY idx_snapshot_runtime_active_snapshot (snapshot_id),
+		KEY idx_snapshot_runtime_active_node (node_id)
+	)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := migrate.Run(ctx, db, "goldendb", testSessionLocker()); err == nil ||
+		!strings.Contains(err.Error(), "schema mismatch: check 4") {
+		t.Fatalf("expected the missing node_ip index to block migration, got %v", err)
+	}
+	var applied int
+	checkApplied := func(want int) {
+		t.Helper()
+		err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM goose_db_version
+			WHERE version_id = 20260701040100 AND is_applied = TRUE`).Scan(&applied)
+		if err != nil || applied != want {
+			t.Fatalf("applied count %d, want %d, err=%v", applied, want, err)
+		}
+	}
+	checkApplied(0)
+	if _, err := db.ExecContext(ctx, `INSERT INTO t_cube_snapshot_runtime_ref
+		(snapshot_id, sandbox_id, binding_type, status) VALUES
+		('fixture-snapshot', 'fixture-sandbox', 'memory_backing', 'ACTIVE')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `ALTER TABLE t_cube_snapshot_runtime_active
+		ADD KEY idx_snapshot_runtime_active_node_ip (node_ip)`); err != nil {
+		t.Fatal(err)
+	}
+	// A prior attempt may have applied one of the purge indexes already.
+	if _, err := db.ExecContext(ctx, `ALTER TABLE t_cube_instance_info
+		ADD KEY idx_instance_info_deleted_at (deleted_at)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := migrate.Run(ctx, db, "goldendb", testSessionLocker()); err != nil {
+		t.Fatalf("resume GoldenDB migration: %v", err)
+	}
+	checkApplied(1)
+	var snapshotID string
+	if err := db.QueryRowContext(ctx, `SELECT snapshot_id FROM t_cube_snapshot_runtime_active
+		WHERE sandbox_id = 'fixture-sandbox' AND binding_type = 'memory_backing'`).Scan(&snapshotID); err != nil ||
+		snapshotID != "fixture-snapshot" {
+		t.Fatalf("expected backfilled snapshot, got %q, err=%v", snapshotID, err)
+	}
+	var purgeIndexes int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM INFORMATION_SCHEMA.STATISTICS
+		WHERE TABLE_SCHEMA = DATABASE() AND COLUMN_NAME = 'deleted_at'
+		AND INDEX_NAME IN ('idx_sandbox_spec_deleted_at', 'idx_instance_info_deleted_at',
+			'idx_instance_userdata_deleted_at', 'idx_template_replica_deleted_at', 'idx_agenthub_snapshot_deleted_at')`).Scan(&purgeIndexes); err != nil ||
+		purgeIndexes != 5 {
+		t.Fatalf("purge index count %d, want 5, err=%v", purgeIndexes, err)
+	}
+}
